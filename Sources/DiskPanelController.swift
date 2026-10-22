@@ -109,8 +109,10 @@ final class DiskPanelController: NSViewController, NSTableViewDataSource, NSTabl
         authorizeButton.isHidden = CPUPrivilege.isInstalled && !monitor.collectionStatus.requiresAuthorization
         authorizeButton.title = CPUPrivilege.isInstalled ? "更新 / 授权…" : "授权…"
         orderControl.selectedSegment = monitor.order.rawValue
+        let previousCount = rows.count
         rows = Array(monitor.sortedApplications.prefix(count))
-        table.reloadData()
+        if previousCount != rows.count { table.reloadData() }
+        else { table.updateExistingRankingCells { [self] cell, row, column in update(cell, column: column, row: row) } }
         emptyLabel.stringValue = monitor.rankingStatus; emptyLabel.isHidden = !rows.isEmpty
     }
 
@@ -123,19 +125,10 @@ final class DiskPanelController: NSViewController, NSTableViewDataSource, NSTabl
     /// 复用网络应用名称单元格，分别渲染读取和写入速度。
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard rows.indices.contains(row), let column = tableColumn else { return nil }
-        let app = rows[row]
         if column.identifier.rawValue == "app" {
             let cell = tableView.makeView(withIdentifier: column.identifier, owner: self) as? ApplicationCell ?? ApplicationCell(frame: .zero)
-            cell.identifier = column.identifier; cell.nameLabel.stringValue = app.name
-            cell.detailLabel.stringValue = app.processes > 1 ? "×\(app.processes)" : ""
-            cell.toolTip = app.name + (app.bundlePath.map { "\n\($0)" } ?? "")
-            if let path = app.bundlePath {
-                if let image = icons.object(forKey: path as NSString) { cell.appIcon.image = image }
-                else {
-                    let image = NSWorkspace.shared.icon(forFile: path); image.size = NSSize(width: 22, height: 22)
-                    icons.setObject(image, forKey: path as NSString); cell.appIcon.image = image
-                }
-            } else { cell.appIcon.image = NSImage(systemSymbolName: "terminal", accessibilityDescription: "系统进程") }
+            cell.identifier = column.identifier
+            update(cell, column: column, row: row)
             return cell
         }
         let cell = tableView.makeView(withIdentifier: column.identifier, owner: self) as? NSTableCellView ?? NSTableCellView()
@@ -151,9 +144,25 @@ final class DiskPanelController: NSViewController, NSTableViewDataSource, NSTabl
                 label.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
             ])
         }
-        cell.textField?.stringValue = SpeedText.string(column.identifier.rawValue == "read" ? app.read : app.write)
-        cell.toolTip = cell.textField?.stringValue
+        update(cell, column: column, row: row)
         return cell
+    }
+
+    /// 当前排序快照原位覆盖已有行；图标身份不变时不重新加载，显示精度内不变的速度也不触发布局。
+    private func update(_ cell: NSTableCellView, column: NSTableColumn, row: Int) {
+        let app = rows[row]
+        if let cell = cell as? ApplicationCell {
+            cell.update(name: app.name, detail: app.processes > 1 ? "×\(app.processes)" : "",
+                toolTip: app.name + (app.bundlePath.map { "\n\($0)" } ?? ""),
+                iconKey: app.bundlePath.map { "app:\($0)" } ?? "terminal") { [self] in
+                    guard let path = app.bundlePath else { return ApplicationCell.terminalIcon }
+                    if let image = icons.object(forKey: path as NSString) { return image }
+                    let image = NSWorkspace.shared.icon(forFile: path); image.size = NSSize(width: 22, height: 22)
+                    icons.setObject(image, forKey: path as NSString); return image
+                }
+        } else {
+            cell.updateRankingValue(SpeedText.string(column.identifier.rawValue == "read" ? app.read : app.write))
+        }
     }
 
     /// 排序设置即时更新当前列表，保持原采样窗口。

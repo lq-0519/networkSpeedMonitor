@@ -8,6 +8,14 @@ final class ApplicationCell: NSTableCellView {
     let nameLabel = NSTextField(labelWithString: "")
     /// 多进程合并的简短说明。
     let detailLabel = NSTextField(labelWithString: "")
+    /// 当前图标的稳定身份；数值刷新和相同软件换位时不重复解析或赋值 NSImage。
+    private var representedIconKey: String?
+    /// 复用系统进程、CPU/内存子进程和设备直连符号，避免每个单元格重新解析系统符号。
+    static let terminalIcon = NSImage(systemSymbolName: "terminal", accessibilityDescription: "系统进程")
+    /// CPU、内存的通用进程图标，与原有外观保持一致。
+    static let processIcon = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "系统进程")
+    /// 临时设备直连行的独立图标，不与普通应用身份混用。
+    static let directIcon = NSImage(systemSymbolName: "antenna.radiowaves.left.and.right", accessibilityDescription: "设备直连传输")
 
     /// 使用固定的轻量布局，所有子视图随 table cell 复用。
     override init(frame frameRect: NSRect) {
@@ -38,6 +46,38 @@ final class ApplicationCell: NSTableCellView {
 
     /// 本应用不从 nib 反序列化表格单元格。
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    /// 原位修改有变化的名称、说明和提示；只有图标身份改变时才调用加载器，不重新构建约束或子视图。
+    func update(name: String, detail: String, toolTip: String, iconKey: String, loadIcon: () -> NSImage?) {
+        if nameLabel.stringValue != name { nameLabel.stringValue = name }
+        if detailLabel.stringValue != detail { detailLabel.stringValue = detail }
+        if self.toolTip != toolTip { self.toolTip = toolTip }
+        if representedIconKey != iconKey {
+            appIcon.image = loadIcon(); representedIconKey = iconKey
+        }
+    }
+}
+
+extension NSTableView {
+    /// 更新已经创建的排行单元格，包含尚未回收的屏外行；不创建视图，滚入的新行仍由数据源读取最新快照。
+    func updateExistingRankingCells(_ update: (NSTableCellView, Int, NSTableColumn) -> Void) {
+        for row in 0..<numberOfRows {
+            for (index, column) in tableColumns.enumerated() {
+                if let cell = view(atColumn: index, row: row, makeIfNecessary: false) as? NSTableCellView {
+                    update(cell, row, column)
+                }
+            }
+        }
+    }
+}
+
+extension NSTableCellView {
+    /// 原位更新数字和悬停说明；显示精度内没有变化时不触发文本布局。
+    func updateRankingValue(_ value: String, toolTip: String? = nil) {
+        if textField?.stringValue != value { textField?.stringValue = value }
+        let detail = toolTip ?? value
+        if self.toolTip != detail { self.toolTip = detail }
+    }
 }
 
 /// 二级网络详情只展示应用排行、排序和接口来源，总上传下载保留在一级概览。
@@ -153,8 +193,10 @@ final class PanelController: NSViewController, NSTableViewDataSource, NSTableVie
         if monitor.directActivity.isVisible, let down = monitor.directDownload, let up = monitor.directUpload {
             ranking.append(.direct(download: down, upload: up, idle: monitor.directActivity.isIdle))
         }
+        let previousCount = rows.count
         rows = NetworkRankingRow.sorted(ranking, by: monitor.preferences.order)
-        table.reloadData()
+        if previousCount != rows.count { table.reloadData() }
+        else { table.updateExistingRankingCells { [self] cell, row, column in update(cell, column: column, row: row) } }
         emptyLabel.stringValue = monitor.rankingStatus
         emptyLabel.isHidden = !rows.isEmpty
         orderControl.selectedSegment = monitor.preferences.order.rawValue
@@ -169,30 +211,11 @@ final class PanelController: NSViewController, NSTableViewDataSource, NSTableVie
     /// 复用单元格，图标只在第一次出现时解析。
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard rows.indices.contains(row), let column = tableColumn else { return nil }
-        let item = rows[row], app = item.application
         if column.identifier.rawValue == "app" {
             let cell = tableView.makeView(withIdentifier: column.identifier, owner: self) as? ApplicationCell
                 ?? ApplicationCell(frame: .zero)
             cell.identifier = column.identifier
-            if let app {
-                cell.nameLabel.stringValue = app.name
-                cell.detailLabel.stringValue = app.processes > 1 ? "×\(app.processes)" : ""
-                cell.toolTip = app.name + (app.bundlePath.map { "\n\($0)" } ?? "")
-                if let path = app.bundlePath {
-                    if let image = icons.object(forKey: path as NSString) { cell.appIcon.image = image }
-                    else {
-                        let image = NSWorkspace.shared.icon(forFile: path)
-                        image.size = NSSize(width: 22, height: 22)
-                        icons.setObject(image, forKey: path as NSString)
-                        cell.appIcon.image = image
-                    }
-                } else { cell.appIcon.image = NSImage(systemSymbolName: "terminal", accessibilityDescription: "系统进程") }
-            } else {
-                cell.nameLabel.stringValue = item.name
-                cell.detailLabel.stringValue = item.isIdle ? "短暂停顿" : "隔空投送等"
-                cell.appIcon.image = NSImage(systemSymbolName: "antenna.radiowaves.left.and.right", accessibilityDescription: "设备直连传输")
-                cell.toolTip = directDescription
-            }
+            update(cell, column: column, row: row)
             return cell
         }
         let cell = tableView.makeView(withIdentifier: column.identifier, owner: self) as? NSTableCellView
@@ -209,10 +232,28 @@ final class PanelController: NSViewController, NSTableViewDataSource, NSTableVie
                 label.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
             ])
         }
-        let speed = column.identifier.rawValue == "down" ? item.download : item.upload
-        cell.textField?.stringValue = SpeedText.string(speed)
-        cell.toolTip = app == nil ? directDescription : cell.textField?.stringValue
+        update(cell, column: column, row: row)
         return cell
+    }
+
+    /// 创建与周期刷新共用同一渲染入口；同数量的排行即使换位，也只更新已有行的内容。
+    private func update(_ cell: NSTableCellView, column: NSTableColumn, row: Int) {
+        let item = rows[row], app = item.application
+        if let cell = cell as? ApplicationCell {
+            let path = app?.bundlePath
+            cell.update(name: item.name, detail: app.map { $0.processes > 1 ? "×\($0.processes)" : "" }
+                ?? (item.isIdle ? "短暂停顿" : "隔空投送等"),
+                toolTip: app.map { $0.name + ($0.bundlePath.map { "\n\($0)" } ?? "") } ?? directDescription,
+                iconKey: path.map { "app:\($0)" } ?? (app == nil ? "direct" : "terminal")) { [self] in
+                    guard let path else { return app == nil ? ApplicationCell.directIcon : ApplicationCell.terminalIcon }
+                    if let image = icons.object(forKey: path as NSString) { return image }
+                    let image = NSWorkspace.shared.icon(forFile: path); image.size = NSSize(width: 22, height: 22)
+                    icons.setObject(image, forKey: path as NSString); return image
+                }
+        } else {
+            let value = SpeedText.string(column.identifier.rawValue == "down" ? item.download : item.upload)
+            cell.updateRankingValue(value, toolTip: app == nil ? directDescription : value)
+        }
     }
 
     /// 解释临时传输条目的独立统计范围；放在悬停提示中，列表只展示名称与当前速度。

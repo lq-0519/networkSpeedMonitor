@@ -128,6 +128,17 @@ enum Diagnostics {
         let networkStatus = StatusItemImage.make(download: "276 KB/s", upload: "36 KB/s", cpuPercent: 95,
                                                 components: [.network], battery: remainingBattery)
         check(networkStatus.isTemplate, "只显示网速时继续使用原生模板图像，不残留彩色内容")
+        let statusBitmaps = batteryStatus.representations.compactMap { $0 as? NSBitmapImageRep }
+        check(statusBitmaps.count == 2 && statusBitmaps.count == batteryStatus.representations.count,
+              "菜单栏已提前生成全部像素，不保留系统快照反复执行的绘图回调")
+        check(statusBitmaps.map(\.pixelsHigh).sorted() == [22, 44]
+              && statusBitmaps.allSatisfy { $0.size == batteryStatus.size },
+              "普通和 Retina 位图使用相同逻辑尺寸且保持正确像素密度")
+        check(statusBitmaps.allSatisfy {
+            let scale = $0.pixelsHigh / 22
+            return ($0.colorAt(x: 7 * scale, y: 11 * scale)?.alphaComponent ?? 0) > 0
+                && ($0.colorAt(x: 0, y: 0)?.alphaComponent ?? 1) == 0
+        }, "位图中 CPU 图像实际可见，边角保持透明，未产生空白或不透明背景")
         let parser = TrafficParser()
         _ = parser.consume(Data(",bytes_in,bytes_out,\nApp.12,999999,888888,\n".utf8), at: 100)
         check(parser.finish() == nil, "首次累计采样不能作为实时速度")
@@ -277,6 +288,15 @@ enum Diagnostics {
         check(cpu.consume(snapshot(200, ticks: 90, start: 20, privileged: false)) == nil, "长时间暂停丢弃旧 CPU 窗口")
         cpu.reset()
         check(cpu.consume(snapshot(202, ticks: 100)) == nil, "关闭后再次打开 CPU 排行重新建基线")
+        let cpuNode = CPUOutlineItem()
+        let firstCPUProcess = CPUProcessUsage(process: snapshot(202, ticks: 100).processes[0], percent: 1)
+        check(cpuNode.updateProcesses([firstCPUProcess]), "CPU 首次进程结构触发子树加载")
+        let existingCPUChild = cpuNode.children[0]
+        check(!cpuNode.updateProcesses([CPUProcessUsage(process: firstCPUProcess.process, percent: 2)])
+              && cpuNode.children[0] === existingCPUChild && cpuNode.children[0].process?.percent == 2,
+              "CPU 纯数值变化复用原节点并呈现最新占用，不重建子树")
+        check(cpuNode.updateProcesses([CPUProcessUsage(process: snapshot(204, ticks: 100, start: 20).processes[0], percent: 3)])
+              && cpuNode.children[0] !== existingCPUChild, "CPU 的 PID 重用生成新节点，不继承旧进程身份")
         let disk = DiskUsageAccumulator()
         /// 构造磁盘差分边界，启动时刻来自同一次累计计数查询。
         func diskSnapshot(_ time: Double, read: UInt64, write: UInt64, start: UInt64 = 10,
@@ -322,6 +342,17 @@ enum Diagnostics {
         ]
         memorySnapshot.memoryDenied = 2
         memorySnapshot.memorySkipped = 3
+        let memoryNode = MemoryOutlineItem()
+        let firstMemoryProcess = memorySnapshot.memoryProcesses![0]
+        check(memoryNode.updateProcesses([firstMemoryProcess]), "内存首次进程结构触发子树加载")
+        let existingMemoryChild = memoryNode.children[0]
+        check(!memoryNode.updateProcesses([MemoryProcessCounter(pid: 12, started: 10,
+              footprintBytes: 456, name: "test", path: "")])
+              && memoryNode.children[0] === existingMemoryChild && memoryNode.children[0].process?.footprintBytes == 456,
+              "内存纯 footprint 变化复用原节点并更新数值，不重建子树")
+        check(memoryNode.updateProcesses([MemoryProcessCounter(pid: 12, started: 20,
+              footprintBytes: 789, name: "new", path: "")]) && memoryNode.children[0] !== existingMemoryChild,
+              "内存的 PID 重用不会沿用旧进程节点")
         let memoryData = try! JSONEncoder().encode(memorySnapshot)
         let decodedMemory = try! JSONDecoder().decode(CPUProcessSnapshot.self, from: memoryData)
         check(decodedMemory.memoryProcesses?.first?.footprintBytes == 123_000_000

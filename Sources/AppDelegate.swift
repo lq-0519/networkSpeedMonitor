@@ -25,6 +25,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusAppearanceObservation: NSKeyValueObservation?
     /// 同一轮主队列只安排一次外观刷新，待系统恢复快照的临时外观后，再由内容与最终外观共同去重。
     private var statusAppearanceRefreshPending = false
+    /// 合并短时间内的 CPU、网速、电池通知；一次性任务只延后绘图，不改变采样或历史记录时刻。
+    private var statusRefreshWork: DispatchWorkItem?
+    /// 辅助功能名称只随组件选择变化；外观快照和数值更新不重复提交相同名称。
+    private var statusAccessibilityLabel: String?
     /// 原生弹窗，点击外部区域自动关闭。
     private let popover = NSPopover()
     /// 弹窗内容控制器，按首次展开创建。
@@ -107,12 +111,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         monitor.onUpdate = { [weak self] in
             guard let self else { return }
-            self.refreshStatusItem()
+            self.requestStatusItemRefresh()
             if self.popover.isShown { self.panel.refreshNetwork() }
         }
         cpu.onUpdate = { [weak self] in
             guard let self else { return }
-            self.refreshStatusItem()
+            self.requestStatusItemRefresh()
             if self.popover.isShown { self.panel.refreshCPU() }
         }
         power.onUpdate = { [weak self] in
@@ -120,7 +124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             self.panel.refreshPower()
             self.panel.refreshFans()
         }
-        battery.onUpdate = { [weak self] in self?.refreshStatusItem() }
+        battery.onUpdate = { [weak self] in self?.requestStatusItemRefresh() }
         cpu.onProcessSnapshot = { [weak self] snapshot, status in
             guard let self else { return }
             self.memory.receive(snapshot, status: status)
@@ -161,6 +165,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// 退出时停止所有采集进程，不保留后台工作。
     func applicationWillTerminate(_ notification: Notification) {
+        statusRefreshWork?.cancel(); statusRefreshWork = nil
         monitor.shutdown()
         cpu.shutdown()
         power.shutdown()
@@ -322,8 +327,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         refreshStatusItem()
     }
 
-    /// 在按钮当前外观下生成一张原生图像；颜色使用实际 CPU 占用，布局、文字与采样保持原有行为。
+    /// 首个通知后最多等待 150 毫秒合并相邻更新；后续通知不顺延期限，持续变化也不会饿死刷新。
+    private func requestStatusItemRefresh() {
+        guard statusRefreshWork == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.statusRefreshWork = nil
+            self.refreshStatusItem()
+        }
+        statusRefreshWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(150), execute: work)
+    }
+
+    /// 在按钮当前外观下生成一张原生位图；设置与外观变化立即应用，并取消已经被覆盖的合并任务。
     private func refreshStatusItem() {
+        statusRefreshWork?.cancel(); statusRefreshWork = nil
         guard let button = statusItem?.button else { return }
         let components = MenuBarPreferences.components
         let down = monitor.download.map(SpeedText.string) ?? "—"
@@ -364,9 +382,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         if components.contains(.cpu) { details.append("整机 CPU：\(cpuText)% · \(cpu.interval) 秒刷新") }
         if components.contains(.battery) { details.append(batteryStatus?.detailText ?? "电池数据不可用") }
-        statusItem?.button?.toolTip = details.joined(separator: "\n")
-        statusItem?.button?.setAccessibilityLabel(selection.map(\.title).joined(separator: "、"))
-        statusItem?.button?.setAccessibilityValue(details.joined(separator: "，"))
+        let detail = details.joined(separator: "\n")
+        if button.toolTip != detail {
+            button.toolTip = detail
+            button.setAccessibilityValue(details.joined(separator: "，"))
+        }
+        let label = selection.map(\.title).joined(separator: "、")
+        if statusAccessibilityLabel != label {
+            button.setAccessibilityLabel(label)
+            statusAccessibilityLabel = label
+        }
     }
 
     /// 将屏幕、系统睡眠及会话事件转换成暂停原因，所有回调串行进入主线程。

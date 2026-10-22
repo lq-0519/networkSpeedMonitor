@@ -6,8 +6,8 @@
     <key>CFBundleDisplayName</key><string>网络速度</string>
     <key>CFBundleExecutable</key><string>NetworkSpeedMonitor</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.9.9</string>
-    <key>CFBundleVersion</key><string>45</string>
+    <key>CFBundleShortVersionString</key><string>1.9.10</string>
+    <key>CFBundleVersion</key><string>46</string>
     <key>SMPrivilegedExecutables</key><dict>
         <key>com.local.NetworkSpeedMonitor.CPUHelper</key>
         <string>identifier "com.local.NetworkSpeedMonitor.CPUHelper" and certificate root = H"659A2CD838DF7ADCB88F313BDE6572A223C4923C"</string>

@@ -13,6 +13,27 @@ final class CPUOutlineItem: NSObject {
     init(application: CPUApplicationUsage? = nil, process: CPUProcessUsage? = nil) {
         self.application = application; self.process = process
     }
+
+    /// 按 PID 和启动时间复用进程节点；返回顺序或成员是否变化，纯占用变化无需重载 outline 子树。
+    func updateProcesses(_ processes: [CPUProcessUsage]) -> Bool {
+        let unchanged = children.count == processes.count && zip(children, processes).allSatisfy { node, usage in
+            node.process?.process.pid == usage.process.pid && node.process?.process.started == usage.process.started
+        }
+        if unchanged {
+            for (node, usage) in zip(children, processes) { node.process = usage }
+            return false
+        }
+        let existing = Dictionary(children.compactMap { node in node.process.map { ($0.process.pid, node) } },
+                                  uniquingKeysWith: { _, new in new })
+        children = processes.map { usage in
+            let node: CPUOutlineItem
+            if let previous = existing[usage.process.pid], previous.process?.process.started == usage.process.started { node = previous }
+            else { node = CPUOutlineItem() }
+            node.process = usage
+            return node
+        }
+        return true
+    }
 }
 
 /// CPU 应用排行按独立 Top 配置展示，展开子进程仍最多十项，汇总总量包含全部进程。
@@ -143,18 +164,26 @@ final class CPUPanelController: NSViewController, NSOutlineViewDataSource, NSOut
         guard lastRankingRevision != monitor.rankingRevision || lastTopCount != topCount else { return }
         lastRankingRevision = monitor.rankingRevision
         lastTopCount = topCount
+        let previousKeys = roots.compactMap { $0.application?.key }
+        var changedChildren: [CPUOutlineItem] = []
         let existing = Dictionary(roots.compactMap { node in node.application.map { ($0.key, node) } }, uniquingKeysWith: { _, new in new })
         roots = monitor.applications.prefix(topCount).map { application in
             let node = existing[application.key] ?? CPUOutlineItem()
             node.application = application
-            node.children = application.processes.prefix(10).map { CPUOutlineItem(process: $0) }
+            if node.updateProcesses(Array(application.processes.prefix(10))) { changedChildren.append(node) }
             return node
         }
-        // reloadData 的折叠通知不能覆盖用户原本选择的展开集合。
+        // 仅根节点结构变化才整表重载；子进程变化只重载对应软件，纯数值变化直接复用单元格。
         let keepExpanded = expanded
-        outline.reloadData()
-        for node in roots where keepExpanded.contains(node.application?.key ?? "") { outline.expandItem(node) }
+        if previousKeys != roots.compactMap({ $0.application?.key }) { outline.reloadData() }
+        else { for node in changedChildren { outline.reloadItem(node, reloadChildren: true) } }
+        for node in roots where keepExpanded.contains(node.application?.key ?? "") && !outline.isItemExpanded(node) {
+            outline.expandItem(node)
+        }
         expanded = keepExpanded.intersection(Set(monitor.applications.map(\.key)))
+        outline.updateExistingRankingCells { [self] cell, row, _ in
+            if let node = outline.item(atRow: row) as? CPUOutlineItem { update(cell, node: node) }
+        }
         emptyLabel.stringValue = monitor.rankingStatus
         emptyLabel.isHidden = !roots.isEmpty
     }
@@ -195,26 +224,32 @@ final class CPUPanelController: NSViewController, NSOutlineViewDataSource, NSOut
                     label.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
                 ])
             }
-            cell.textField?.stringValue = String(format: "%.1f%%", node.application?.percent ?? node.process?.percent ?? 0)
-            cell.toolTip = cell.textField?.stringValue
+            update(cell, node: node)
             return cell
         }
         let cell = outlineView.makeView(withIdentifier: column.identifier, owner: self) as? ApplicationCell ?? ApplicationCell(frame: .zero)
         cell.identifier = column.identifier
-        cell.nameLabel.stringValue = node.application?.name ?? node.process?.process.name ?? ""
-        cell.detailLabel.stringValue = node.application.map { $0.processCount > 1 ? "×\($0.processCount)" : "" }
-            ?? node.process.map { "PID \($0.process.pid)" } ?? ""
-        if let path = node.application?.bundlePath {
-            if let icon = icons.object(forKey: path as NSString) { cell.appIcon.image = icon }
-            else {
-                let icon = NSWorkspace.shared.icon(forFile: path)
-                icon.size = NSSize(width: 22, height: 22)
-                icons.setObject(icon, forKey: path as NSString); cell.appIcon.image = icon
-            }
-        } else { cell.appIcon.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "系统进程") }
-        let path = node.application?.bundlePath ?? node.process?.process.path
-        cell.toolTip = cell.nameLabel.stringValue + (path.map { "\n\($0)" } ?? "")
+        update(cell, node: node)
         return cell
+    }
+
+    /// 节点身份和展开状态保持稳定；只修改当前单元格实际变化的内容，隐藏行滚入时使用同一入口。
+    private func update(_ cell: NSTableCellView, node: CPUOutlineItem) {
+        if let cell = cell as? ApplicationCell {
+            let name = node.application?.name ?? node.process?.process.name ?? ""
+            let path = node.application?.bundlePath ?? node.process?.process.path
+            cell.update(name: name, detail: node.application.map { $0.processCount > 1 ? "×\($0.processCount)" : "" }
+                ?? node.process.map { "PID \($0.process.pid)" } ?? "",
+                toolTip: name + (path.map { "\n\($0)" } ?? ""),
+                iconKey: node.application?.bundlePath.map { "app:\($0)" } ?? "process") { [self] in
+                    guard let path = node.application?.bundlePath else { return ApplicationCell.processIcon }
+                    if let icon = icons.object(forKey: path as NSString) { return icon }
+                    let icon = NSWorkspace.shared.icon(forFile: path); icon.size = NSSize(width: 22, height: 22)
+                    icons.setObject(icon, forKey: path as NSString); return icon
+                }
+        } else {
+            cell.updateRankingValue(String(format: "%.1f%%", node.application?.percent ?? node.process?.percent ?? 0))
+        }
     }
 
     /// 记录手动展开，以便每两秒刷新时保留层级。

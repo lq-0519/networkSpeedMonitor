@@ -14,6 +14,27 @@ final class MemoryOutlineItem: NSObject {
         self.application = application
         self.process = process
     }
+
+    /// 按 PID 和启动时间保留现有节点；单纯 footprint 改变只更新数值，不重载进程子树。
+    func updateProcesses(_ processes: [MemoryProcessCounter]) -> Bool {
+        let unchanged = children.count == processes.count && zip(children, processes).allSatisfy { node, process in
+            node.process?.pid == process.pid && node.process?.started == process.started
+        }
+        if unchanged {
+            for (node, process) in zip(children, processes) { node.process = process }
+            return false
+        }
+        let existing = Dictionary(children.compactMap { node in node.process.map { ($0.pid, node) } },
+                                  uniquingKeysWith: { _, new in new })
+        children = processes.map { process in
+            let node: MemoryOutlineItem
+            if let previous = existing[process.pid], previous.process?.started == process.started { node = previous }
+            else { node = MemoryOutlineItem() }
+            node.process = process
+            return node
+        }
+        return true
+    }
 }
 
 /// 弹窗中的整机内存摘要与软件排行；只渲染 CPU 同轮快照，不持有采样计时器。
@@ -145,7 +166,7 @@ final class MemoryPanelController: NSViewController, NSOutlineViewDataSource, NS
         usageLabel.toolTip = "已用内存根据 Mach VM 页计数计算；总量为机器物理内存。"
     }
 
-    /// 更新整机摘要和覆盖状态，仅在模型版本或 Top 设置变化时重建 outline。
+    /// 更新整机摘要和覆盖状态；模型版本或 Top 设置变化后，只对结构改变的排行层级进行重载。
     func refresh() {
         guard isViewLoaded else { return }
         let topCount = RankingPreferences.count(for: .memory)
@@ -175,21 +196,27 @@ final class MemoryPanelController: NSViewController, NSOutlineViewDataSource, NS
         guard lastRankingRevision != monitor.rankingRevision || lastTopCount != topCount else { return }
         lastRankingRevision = monitor.rankingRevision
         lastTopCount = topCount
+        let previousKeys = roots.compactMap { $0.application?.key }
+        var changedChildren: [MemoryOutlineItem] = []
         let existing = Dictionary(roots.compactMap { node in
             node.application.map { ($0.key, node) }
         }, uniquingKeysWith: { _, new in new })
         roots = monitor.applications.prefix(topCount).map { application in
             let node = existing[application.key] ?? MemoryOutlineItem()
             node.application = application
-            node.children = application.processes.prefix(10).map { MemoryOutlineItem(process: $0) }
+            if node.updateProcesses(Array(application.processes.prefix(10))) { changedChildren.append(node) }
             return node
         }
         let keepExpanded = expanded
-        outline.reloadData()
-        for node in roots where keepExpanded.contains(node.application?.key ?? "") {
+        if previousKeys != roots.compactMap({ $0.application?.key }) { outline.reloadData() }
+        else { for node in changedChildren { outline.reloadItem(node, reloadChildren: true) } }
+        for node in roots where keepExpanded.contains(node.application?.key ?? "") && !outline.isItemExpanded(node) {
             outline.expandItem(node)
         }
         expanded = keepExpanded.intersection(Set(monitor.applications.map(\.key)))
+        outline.updateExistingRankingCells { [self] cell, row, _ in
+            if let node = outline.item(atRow: row) as? MemoryOutlineItem { update(cell, node: node) }
+        }
         emptyLabel.stringValue = monitor.rankingStatus
         emptyLabel.isHidden = !roots.isEmpty
     }
@@ -238,32 +265,33 @@ final class MemoryPanelController: NSViewController, NSOutlineViewDataSource, NS
                     label.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
                 ])
             }
-            let bytes = node.application?.footprintBytes ?? node.process?.footprintBytes ?? 0
-            cell.textField?.stringValue = MemoryText.string(bytes)
-            cell.toolTip = cell.textField?.stringValue
+            update(cell, node: node)
             return cell
         }
         let cell = outlineView.makeView(withIdentifier: column.identifier, owner: self) as? ApplicationCell
             ?? ApplicationCell(frame: .zero)
         cell.identifier = column.identifier
-        cell.nameLabel.stringValue = node.application?.name ?? node.process?.name ?? ""
-        cell.detailLabel.stringValue = node.application.map { $0.processCount > 1 ? "×\($0.processCount)" : "" }
-            ?? node.process.map { "PID \($0.pid)" } ?? ""
-        if let path = node.application?.bundlePath {
-            if let icon = icons.object(forKey: path as NSString) {
-                cell.appIcon.image = icon
-            } else {
-                let icon = NSWorkspace.shared.icon(forFile: path)
-                icon.size = NSSize(width: 22, height: 22)
-                icons.setObject(icon, forKey: path as NSString)
-                cell.appIcon.image = icon
-            }
-        } else {
-            cell.appIcon.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "系统进程")
-        }
-        let path = node.application?.bundlePath ?? node.process?.path
-        cell.toolTip = cell.nameLabel.stringValue + (path.map { "\n\($0)" } ?? "")
+        update(cell, node: node)
         return cell
+    }
+
+    /// 软件与子进程沿用同一轻量渲染路径；视图、约束和相同身份的图标随数值更新持续复用。
+    private func update(_ cell: NSTableCellView, node: MemoryOutlineItem) {
+        if let cell = cell as? ApplicationCell {
+            let name = node.application?.name ?? node.process?.name ?? ""
+            let path = node.application?.bundlePath ?? node.process?.path
+            cell.update(name: name, detail: node.application.map { $0.processCount > 1 ? "×\($0.processCount)" : "" }
+                ?? node.process.map { "PID \($0.pid)" } ?? "",
+                toolTip: name + (path.map { "\n\($0)" } ?? ""),
+                iconKey: node.application?.bundlePath.map { "app:\($0)" } ?? "process") { [self] in
+                    guard let path = node.application?.bundlePath else { return ApplicationCell.processIcon }
+                    if let icon = icons.object(forKey: path as NSString) { return icon }
+                    let icon = NSWorkspace.shared.icon(forFile: path); icon.size = NSSize(width: 22, height: 22)
+                    icons.setObject(icon, forKey: path as NSString); return icon
+                }
+        } else {
+            cell.updateRankingValue(MemoryText.string(node.application?.footprintBytes ?? node.process?.footprintBytes ?? 0))
+        }
     }
 
     /// 记录用户手动展开的软件，使下一轮即时快照不折叠当前查看位置。

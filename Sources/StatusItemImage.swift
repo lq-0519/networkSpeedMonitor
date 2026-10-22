@@ -34,6 +34,13 @@ enum StatusItemColorScale {
 
 /// 单个菜单栏按钮的组合图像，按 CPU、网速、电池固定顺序拼接勾选的内容。
 enum StatusItemImage {
+    /// 系统符号只解析一次；最终颜色在每张位图的独立透明层内合成，不保留延迟绘图回调。
+    private static let lightningSymbol: NSImage? = {
+        let image = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: nil)
+        image?.isTemplate = false
+        return image
+    }()
+
     /// 以两位数 KB/s 为基准，把旧版固定列宽超出的缓冲压至三分之一；字体、文字本身不缩放。
     private static let compactNetworkWidth: CGFloat = {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium)
@@ -58,7 +65,7 @@ enum StatusItemImage {
         return max(compactNetworkWidth, ceil(right - left))
     }
 
-    /// 保留现有尺寸和字号，合成为原生按钮的一张图，由 AppKit 统一处理选中、非活动及菜单栏外观。
+    /// 保留现有尺寸和字号，提前生成普通与 Retina 位图；系统快照只复制像素，不重复执行文字和符号绘制。
     /// minimumNetworkWidth 由主应用保留已使用的最大列宽，缩小缓冲后也不会随数字变短而反复回缩。
     static func make(download: String, upload: String, cpuPercent: Double?,
                      components: Set<MenuBarComponent>, battery: BatteryStatus?, minimumNetworkWidth: CGFloat = 0) -> NSImage {
@@ -94,10 +101,21 @@ enum StatusItemImage {
         let batteryWidth = ceil(max(upperWidth, secondaryBounds.width))
         if components.contains(.battery) { width += batteryWidth }
         let size = NSSize(width: max(14, width), height: 22)
-        let image = NSImage(size: size, flipped: false) { rect in
-            guard let context = NSGraphicsContext.current?.cgContext else { return false }
+        let image = NSImage(size: size)
+        for scale in [1, 2] {
+            guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil,
+                pixelsWide: Int(ceil(size.width)) * scale, pixelsHigh: Int(size.height) * scale,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+                let graphics = NSGraphicsContext(bitmapImageRep: bitmap) else { continue }
+            bitmap.size = size
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = graphics
+            let context = graphics.cgContext
+            context.scaleBy(x: CGFloat(scale), y: CGFloat(scale))
+            let rect = NSRect(origin: .zero, size: size)
+            context.clear(rect)
             context.saveGState()
-            defer { context.restoreGState() }
             if components.contains(.cpu) { drawCPU(cpuColor == nil ? nil : cpuPercent, color: cpuColor ?? foreground, in: context) }
             context.textMatrix = .identity
             if components.contains(.network) {
@@ -114,20 +132,19 @@ enum StatusItemImage {
                 draw(percentage, bounds: percentageBounds, origin: batteryOrigin,
                      width: batteryWidth - (lightning ? 9 : 0), row: 1, in: context)
                 if lightning {
-                    let symbol = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: nil)
-                    // 将闪电也变成同图内的普通像素，保证它与文字一起接受原生按钮的淡化处理。
-                    symbol?.isTemplate = false
-                    let symbolColor = NSImage(size: NSSize(width: 7, height: 8), flipped: false) { rect in
-                        symbol?.draw(in: rect)
-                        foreground.setFill()
-                        rect.fill(using: .sourceIn)
-                        return true
-                    }
-                    symbolColor.draw(in: NSRect(x: batteryOrigin + (batteryWidth - upperWidth) / 2 + percentageBounds.width + 2,
-                                               y: 12.5, width: 7, height: 8))
+                    let bolt = NSRect(x: batteryOrigin + (batteryWidth - upperWidth) / 2 + percentageBounds.width + 2,
+                                      y: 12.5, width: 7, height: 8)
+                    context.beginTransparencyLayer(auxiliaryInfo: nil)
+                    lightningSymbol?.draw(in: bolt)
+                    context.setBlendMode(.sourceIn)
+                    context.setFillColor(foreground.cgColor)
+                    context.fill(bolt)
+                    context.endTransparencyLayer()
                 }
             }
-            return true
+            context.restoreGState()
+            NSGraphicsContext.restoreGraphicsState()
+            image.addRepresentation(bitmap)
         }
         image.isTemplate = isTemplate
         return image
