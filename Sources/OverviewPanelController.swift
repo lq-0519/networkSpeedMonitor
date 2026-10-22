@@ -4,7 +4,7 @@ import AppKit
 final class OverviewPanelController: NSViewController {
     /// 电源指标独立刷新，不重建网络或 CPU 列表。
     private let powerPanel: PowerPanelController
-    /// 电量历史只在电源详情中切换到电量页时读取系统数据库，不参与实时功率采样。
+    /// 电量历史随电源详情按需读取系统数据库，直接显示在功率趋势上方，不参与实时功率采样。
     private let powerHistoryPanel: PowerHistoryPanelController
     /// 风扇指标与电源共用快照通知，无风扇机型由子控制器自动折叠。
     private let fanPanel: FanPanelController

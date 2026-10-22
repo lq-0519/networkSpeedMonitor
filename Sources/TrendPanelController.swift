@@ -8,7 +8,7 @@ private enum TrendAxis {
     case memory
     /// 普通速度、功率或转速从零开始，按窗口峰值扩展。
     case positive
-    /// 电池净功率保留正充入、负放出的方向。
+    /// 多项功率共用瓦特坐标；电池放电可低于零，输入与系统耗电保持正值。
     case signed
     /// 已用容量紧贴窗口真实最小最大值，不强制从零开始。
     case capacity
@@ -28,7 +28,7 @@ private struct TrendChartSpec {
     let height: CGFloat
 }
 
-/// 在现有资源二级详情上方组合趋势，继续复用原生应用排行和独立系统电量历史。
+/// 组合资源趋势、原生应用排行和按需系统电量历史，不改变底层采样生命周期。
 final class ResourceTrendController: NSViewController {
     /// 当前资源决定图表组和需要读取的历史列。
     private let section: ResourceSection
@@ -36,7 +36,7 @@ final class ResourceTrendController: NSViewController {
     private let history: TrendHistoryStore
     /// 原有排行控制器，表格仍使用独立滚动区域。
     private let ranking: NSViewController?
-    /// 电源独有的旧电量历史页面，只在用户切换到该页时读取 Powerlog。
+    /// 电源独有的系统电量历史，和功率趋势在同一个详情中上下排列。
     private let batteryHistory: PowerHistoryPanelController?
     /// 新曲线固定四档，初次及关闭一级弹窗后恢复一分钟。
     private var range: TrendRange = .minute
@@ -50,17 +50,13 @@ final class ResourceTrendController: NSViewController {
     private var visible = false
     /// 正在加载期间的样本由同一历史队列快照覆盖，不重复叠加。
     private var loading = false
-    /// 电源切换到旧电量页面时暂停新趋势的渲染。
-    private var showingBatteryHistory = false
     /// 可见范围右边界随真实采样更新，不额外设置 UI 定时器。
     private var end = Date().timeIntervalSince1970
     /// 所有新趋势共用的四档范围控件。
     private let rangeControl = NSSegmentedControl(labels: TrendRange.allCases.map(\.title), trackingMode: .selectOne, target: nil, action: nil)
-    /// 功率与电量分开显示，保留旧系统历史的范围和读取语义。
-    private let powerPages = NSSegmentedControl(labels: ["功率趋势", "电量历史"], trackingMode: .selectOne, target: nil, action: nil)
-    /// 当前资源的一至三张轻量原生曲线。
+    /// 当前资源的一至两张轻量原生曲线；功率三项和磁盘读写分别共享坐标区域。
     private var charts: [TrendChartView] = []
-    /// 图表组可整体隐藏，隐藏后不占用旧电量页面空间。
+    /// 图表组只包含当前资源的实时趋势，不承载系统电量历史。
     private let chartStack = NSStackView()
     /// 仅在较早历史不可读时出现，实时内存曲线仍可展示。
     private let errorLabel = NSTextField(labelWithString: "")
@@ -81,12 +77,11 @@ final class ResourceTrendController: NSViewController {
         case .cpu: return [TrendChartSpec(title: "CPU 占用", metrics: [.cpu], axis: .percent, height: 150)]
         case .memory: return [TrendChartSpec(title: "已用内存", metrics: [.memory], axis: .memory, height: 150)]
         case .network: return [TrendChartSpec(title: "网络速度", metrics: [.download, .upload], axis: .mirrored, height: 170)]
-        case .disk: return [TrendChartSpec(title: "磁盘已用容量", metrics: [.diskUsed], axis: .capacity, height: 105),
-                            TrendChartSpec(title: "磁盘读取", metrics: [.diskRead], axis: .positive, height: 90),
-                            TrendChartSpec(title: "磁盘写入", metrics: [.diskWrite], axis: .positive, height: 90)]
-        case .power: return [TrendChartSpec(title: "系统耗电", metrics: [.systemPower], axis: .positive, height: 150),
-                             TrendChartSpec(title: "输入功率", metrics: [.inputPower], axis: .positive, height: 100),
-                             TrendChartSpec(title: "电池充放电功率", metrics: [.batteryPower], axis: .signed, height: 100)]
+        case .disk: return [TrendChartSpec(title: "磁盘已用容量", metrics: [.diskUsed], axis: .capacity, height: 125),
+                            TrendChartSpec(title: "磁盘读写", metrics: [.diskRead, .diskWrite], axis: .mirrored, height: 170)]
+        case .power: return [TrendChartSpec(title: "功率对比",
+                                            metrics: [.systemPower, .inputPower, .batteryPower],
+                                            axis: .signed, height: 190)]
         case .fan: return [TrendChartSpec(title: "风扇转速", metrics: (0..<10).compactMap(TrendMetric.fan), axis: .positive, height: 210)]
         }
     }
@@ -94,7 +89,7 @@ final class ResourceTrendController: NSViewController {
     /// 展示图表时只查询该资源对应的固定列。
     private var metrics: [TrendMetric] { specifications.flatMap(\.metrics) }
 
-    /// 上方固定趋势、下方可伸缩排行；屏幕高度不足时优先压缩图表而非遮住排行按钮。
+    /// 常规资源上方显示趋势、下方伸缩排行；电源先展示电量历史，再展示功率趋势。
     override func loadView() {
         view = NSView(frame: NSRect(x: 0, y: 0, width: 392, height: 460))
         let root = NSStackView()
@@ -105,15 +100,13 @@ final class ResourceTrendController: NSViewController {
             root.leadingAnchor.constraint(equalTo: view.leadingAnchor), root.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             root.topAnchor.constraint(equalTo: view.topAnchor), root.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
-        let title = NSTextField(labelWithString: "\(section.title)趋势")
+        let title = NSTextField(labelWithString: section == .power ? "功率趋势" : "\(section.title)趋势")
         title.font = .systemFont(ofSize: 13, weight: .semibold)
         rangeControl.controlSize = .small; rangeControl.selectedSegment = 0
         rangeControl.target = self; rangeControl.action = #selector(changeRange)
         rangeControl.setAccessibilityLabel("\(section.title)趋势时间范围")
-        powerPages.controlSize = .small; powerPages.selectedSegment = 0
-        powerPages.target = self; powerPages.action = #selector(changePowerPage)
-        let header = NSStackView(views: [section == .power ? powerPages : title, NSView(), rangeControl])
-        header.alignment = .centerY; root.addArrangedSubview(header)
+        let header = NSStackView(views: [title, NSView(), rangeControl])
+        header.alignment = .centerY
         chartStack.orientation = .vertical; chartStack.alignment = .leading; chartStack.spacing = 8
         chartStack.detachesHiddenViews = true
         for spec in specifications {
@@ -125,15 +118,22 @@ final class ResourceTrendController: NSViewController {
             chart.widthAnchor.constraint(equalTo: chartStack.widthAnchor).isActive = true
             chart.onHoverTime = { [weak self] time in self?.charts.forEach { $0.setHover(time) } }
         }
-        root.addArrangedSubview(chartStack)
         errorLabel.font = .systemFont(ofSize: 10); errorLabel.textColor = .secondaryLabelColor; errorLabel.isHidden = true
+        if let batteryHistory {
+            addChild(batteryHistory)
+            root.addArrangedSubview(batteryHistory.view)
+            batteryHistory.view.heightAnchor.constraint(equalToConstant: 312).isActive = true
+            let separator = NSBox()
+            separator.boxType = .separator
+            root.addArrangedSubview(separator)
+            separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        }
+        root.addArrangedSubview(header)
+        root.addArrangedSubview(chartStack)
         root.addArrangedSubview(errorLabel)
         if let ranking {
             addChild(ranking); root.addArrangedSubview(ranking.view)
             ranking.view.setContentHuggingPriority(.defaultLow, for: .vertical)
-        }
-        if let batteryHistory {
-            addChild(batteryHistory); root.addArrangedSubview(batteryHistory.view); batteryHistory.view.isHidden = true
         }
         // 无排行时使用底部弹性空间，避免窗口拉高时把图表强行拉伸。
         if ranking == nil {
@@ -144,14 +144,14 @@ final class ResourceTrendController: NSViewController {
         render()
     }
 
-    /// 仅当前详情订阅实时曲线，旧系统电量页面拥有独立按需读取生命周期。
+    /// 仅当前详情订阅实时曲线；电源可见时同步启动按需系统电量历史读取。
     func setVisible(_ value: Bool) {
         visible = value; epoch = UUID(); loading = false
-        history.observe(metrics: value && !showingBatteryHistory ? metrics : [])
+        history.observe(metrics: value ? metrics : [])
         if value {
             _ = view
-            if showingBatteryHistory { batteryHistory?.setVisible(true) }
-            else { reload() }
+            batteryHistory?.setVisible(true)
+            reload()
         } else {
             batteryHistory?.setVisible(false)
             series.removeAll(); watermark = 0
@@ -159,19 +159,18 @@ final class ResourceTrendController: NSViewController {
         }
     }
 
-    /// 关闭一级弹窗后重置新趋势范围和功率页，不修改系统电量历史的既有默认值。
+    /// 关闭一级弹窗后重置功率趋势和系统电量历史各自的默认范围。
     func resetRange() {
-        range = .minute; showingBatteryHistory = false
+        range = .minute
         batteryHistory?.resetRange()
         if isViewLoaded {
-            rangeControl.selectedSegment = 0; powerPages.selectedSegment = 0
-            chartStack.isHidden = false; rangeControl.isHidden = false; batteryHistory?.view.isHidden = true
+            rangeControl.selectedSegment = 0
         }
     }
 
     /// 合并尚未入库的实时样本；数据库提交完成不会改变曲线或导致重复绘制。
     func receive(_ sample: TrendSample) {
-        guard visible, !showingBatteryHistory, !loading, sample.id > watermark else { return }
+        guard visible, !loading, sample.id > watermark else { return }
         let relevant = sample.values.filter { metrics.contains($0.metric) }
         guard !relevant.isEmpty else { return }
         watermark = sample.id; end = Date().timeIntervalSince1970
@@ -204,24 +203,13 @@ final class ResourceTrendController: NSViewController {
         reload()
     }
 
-    /// 用户显式选择电量历史时才启动 Powerlog 查询，返回功率页时立即加载当前趋势。
-    @objc private func changePowerPage() {
-        showingBatteryHistory = powerPages.selectedSegment == 1
-        history.observe(metrics: visible && !showingBatteryHistory ? metrics : [])
-        epoch = UUID(); loading = false
-        chartStack.isHidden = showingBatteryHistory; rangeControl.isHidden = showingBatteryHistory
-        errorLabel.isHidden = true; batteryHistory?.view.isHidden = !showingBatteryHistory
-        batteryHistory?.setVisible(visible && showingBatteryHistory)
-        if !showingBatteryHistory { reload() }
-    }
-
     /// 数据库与缓冲由一个队列产生一致快照，样本通知按同队列顺序在快照之后继续交付。
     private func reload() {
-        guard visible, !showingBatteryHistory else { return }
+        guard visible else { return }
         let current = UUID(); epoch = current; loading = true
         series.removeAll(); end = Date().timeIntervalSince1970; errorLabel.isHidden = true; render()
         history.load(metrics: metrics, range: range) { [weak self] snapshot in
-            guard let self, self.visible, self.epoch == current, !self.showingBatteryHistory else { return }
+            guard let self, self.visible, self.epoch == current else { return }
             self.loading = false; self.series = snapshot.series; self.watermark = snapshot.watermark
             self.end = Date().timeIntervalSince1970
             self.errorLabel.stringValue = snapshot.error ?? ""; self.errorLabel.isHidden = snapshot.error == nil
@@ -290,7 +278,7 @@ private final class TrendChartView: NSView {
         case .percent: limits = (0, 100)
         case .memory: limits = (0, Double(ProcessInfo.processInfo.physicalMemory))
         case .mirrored: let peak = max(1024, maximum); limits = (-peak, peak)
-        case .signed: let peak = max(1, max(abs(minimum), abs(maximum))); limits = (-peak, peak)
+        case .signed: limits = (min(0, minimum), max(1, maximum))
         case .positive: limits = (0, max(1, maximum))
         case .capacity:
             let padding = max(50_000_000, abs(minimum) * 0.00001)
@@ -323,7 +311,7 @@ private final class TrendChartView: NSView {
     /// 指针移出后恢复最新读数，不保留过期悬停位置。
     override func mouseExited(with event: NSEvent) { onHoverTime?(nil) }
 
-    /// 原生线条与轻量面积填充，下载向上、上传向下；数据缺失和生命周期分段均断线。
+    /// 原生线条与轻量面积填充，下载/读取向上、上传/写入向下；缺失和生命周期分段均断线。
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         drawText(specification.title, rect: NSRect(x: 0, y: bounds.maxY - 16, width: 145, height: 14), color: .labelColor, weight: .medium)
@@ -356,7 +344,7 @@ private final class TrendChartView: NSView {
             drawText(format(abs(value), metric: axisMetric, signed: specification.axis == .signed && value < 0),
                      rect: NSRect(x: 0, y: y - 6, width: plot.minX - 6, height: 12), alignment: .right)
         }
-        timeFormatter.dateFormat = range == .minute ? "HH:mm:ss" : "HH:mm"
+        timeFormatter.dateFormat = range == .minute ? "HH:mm:ss" : (range == .day ? "M/d HH:mm" : "HH:mm")
         for fraction in [0.0, 0.5, 1.0] {
             let time = end - Double(range.rawValue) * (1 - fraction)
             let x = plot.minX + CGFloat(fraction) * plot.width
@@ -381,9 +369,14 @@ private final class TrendChartView: NSView {
                 if let previous, previous.value != nil, previous.segment == point.segment, !point.breakBefore {
                     let before = coordinate(previous, metric: metric)
                     let zero = y(max(limits.low, min(limits.high, 0)))
-                    let fill = NSBezierPath(); fill.move(to: NSPoint(x: before.x, y: zero)); fill.line(to: before)
-                    fill.line(to: location); fill.line(to: NSPoint(x: location.x, y: zero)); fill.close()
-                    color.withAlphaComponent(0.10).setFill(); fill.fill()
+                    let shouldFill: Bool
+                    if case .mirrored = specification.axis { shouldFill = true }
+                    else { shouldFill = specification.metrics.count == 1 }
+                    if shouldFill {
+                        let fill = NSBezierPath(); fill.move(to: NSPoint(x: before.x, y: zero)); fill.line(to: before)
+                        fill.line(to: location); fill.line(to: NSPoint(x: location.x, y: zero)); fill.close()
+                        color.withAlphaComponent(0.10).setFill(); fill.fill()
+                    }
                     let line = NSBezierPath(); line.move(to: before); line.line(to: location)
                     color.setStroke(); line.lineWidth = 1.5; line.stroke()
                 }
@@ -398,6 +391,9 @@ private final class TrendChartView: NSView {
             NSColor.secondaryLabelColor.withAlphaComponent(0.6).setStroke(); guide.lineWidth = 0.5; guide.stroke()
         }
         NSGraphicsContext.restoreGraphicsState()
+        if let hoverTime {
+            drawHoverTime(hoverTime)
+        }
     }
 
     /// 将真实数值映射到纵轴；容量面积填充也会被裁剪在窗口最小最大值之间。
@@ -405,9 +401,10 @@ private final class TrendChartView: NSView {
         plot.minY + CGFloat((value - limits.low) / max(0.000001, limits.high - limits.low)) * plot.height
     }
 
-    /// 上传仅改变视觉方向，实际读数和历史值始终为正速度。
+    /// 上传和磁盘写入仅改变视觉方向，实际读数和历史值始终为正速度。
     private func coordinate(_ point: TrendPoint, metric: TrendMetric) -> NSPoint {
-        let value = (point.value ?? 0) * (specification.axis == .mirrored && metric == .upload ? -1 : 1)
+        let mirroredBelow = metric == .upload || metric == .diskWrite
+        let value = (point.value ?? 0) * (specification.axis == .mirrored && mirroredBelow ? -1 : 1)
         return NSPoint(x: plot.minX + CGFloat((point.time - end + Double(range.rawValue)) / Double(range.rawValue)) * plot.width, y: y(value))
     }
 
@@ -416,6 +413,11 @@ private final class TrendChartView: NSView {
         switch metric {
         case .download: return "↓下载"
         case .upload: return "↑上传"
+        case .diskRead: return "读取"
+        case .diskWrite: return "写入"
+        case .systemPower: return "系统"
+        case .inputPower: return "输入"
+        case .batteryPower: return "电池"
         default:
             if metric.rawValue >= TrendMetric.fan0.rawValue { return "风扇\(metric.rawValue - TrendMetric.fan0.rawValue + 1)" }
             return specification.title
@@ -426,12 +428,33 @@ private final class TrendChartView: NSView {
     private func color(_ metric: TrendMetric) -> NSColor {
         if metric == .upload || metric == .diskWrite { return .systemOrange }
         if metric == .download || metric == .diskRead { return .systemBlue }
+        if metric == .inputPower { return .systemBlue }
+        if metric == .batteryPower { return .systemOrange }
+        if metric == .systemPower { return .systemGreen }
         if metric.rawValue >= TrendMetric.fan0.rawValue {
             let colors: [NSColor] = [.systemBlue, .systemOrange, .systemGreen, .systemPurple, .systemPink,
                                      .systemTeal, .systemRed, .systemYellow, .systemBrown, .systemCyan]
             return colors[(metric.rawValue - TrendMetric.fan0.rawValue) % colors.count]
         }
         return .systemGreen
+    }
+
+    /// 在悬浮竖线正下方绘制对应横轴时间，并限制在绘图区内以免靠近两端时被窗口裁剪。
+    private func drawHoverTime(_ time: TimeInterval) {
+        timeFormatter.dateFormat = range == .day ? "M/d HH:mm" : "HH:mm:ss"
+        let text = timeFormatter.string(from: Date(timeIntervalSince1970: time))
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
+        let width = ceil((text as NSString).size(withAttributes: [.font: font]).width) + 10
+        let lineX = plot.minX + CGFloat((time - end + Double(range.rawValue)) / Double(range.rawValue)) * plot.width
+        let originX = min(plot.maxX - width, max(plot.minX, lineX - width / 2))
+        let rect = NSRect(x: originX, y: 0, width: width, height: 15)
+        NSColor.controlBackgroundColor.withAlphaComponent(0.96).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 3, yRadius: 3).fill()
+        NSColor.separatorColor.setStroke()
+        let border = NSBezierPath(roundedRect: rect.insetBy(dx: 0.25, dy: 0.25), xRadius: 3, yRadius: 3)
+        border.lineWidth = 0.5
+        border.stroke()
+        drawText(text, rect: rect, color: .labelColor, weight: .medium, alignment: .center)
     }
 
     /// 容量保留足够小数区分窄窗口；速度复用应用现有单位口径。

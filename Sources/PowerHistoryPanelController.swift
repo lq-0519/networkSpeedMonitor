@@ -270,6 +270,22 @@ private final class PowerHistoryChartView: NSView {
         let text = timeFormatter.string(from: Date(timeIntervalSince1970: sample.time))
             + String(format: " · %.0f%% · ", sample.percent) + state
         drawText(text, at: NSPoint(x: plot.maxX - textWidth(text), y: bounds.maxY - 15), color: .labelColor)
+        drawHoverTime(sample.time, lineX: location.x)
+    }
+
+    /// 把真实系统电量记录的时间标在悬浮线下方，并钳制到横轴范围内避免长日期越界。
+    private func drawHoverTime(_ time: TimeInterval, lineX: CGFloat) {
+        let text = timeFormatter.string(from: Date(timeIntervalSince1970: time))
+        let width = ceil(textWidth(text)) + 10
+        let originX = min(plot.maxX - width, max(plot.minX, lineX - width / 2))
+        let rect = NSRect(x: originX, y: 3, width: width, height: 15)
+        NSColor.controlBackgroundColor.withAlphaComponent(0.96).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 3, yRadius: 3).fill()
+        NSColor.separatorColor.setStroke()
+        let border = NSBezierPath(roundedRect: rect.insetBy(dx: 0.25, dy: 0.25), xRadius: 3, yRadius: 3)
+        border.lineWidth = 0.5
+        border.stroke()
+        drawText(text, at: NSPoint(x: rect.minX + 5, y: rect.minY + 1), color: .labelColor)
     }
 
     /// 统一使用小字号系统字体测量，保证坐标文字和顶部悬停读数不越过浮窗边界。

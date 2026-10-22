@@ -87,7 +87,7 @@ private final class ResourceDetailHostController: NSViewController {
 
 /// 管理唯一二级浮层的展示、资源切换、屏幕边缘定位和跨窗口关闭延迟。
 final class ResourceDetailCoordinator {
-    /// 资源详情控制器；电量历史生命周期由呈现和关闭回调按需管理。
+    /// 资源详情控制器；电量历史生命周期由电源详情的呈现和关闭回调按需管理。
     private let controllers: [ResourceSection: NSViewController]
     /// 可复用内容宿主，避免资源间移动时反复创建窗口。
     private let host = ResourceDetailHostController()
@@ -121,6 +121,7 @@ final class ResourceDetailCoordinator {
         panel.isReleasedWhenClosed = false
         panel.animationBehavior = .none
         panel.collectionBehavior = [.transient, .moveToActiveSpace]
+        panel.becomesKeyOnlyIfNeeded = true
         panel.contentViewController = host
         host.container.onEnter = { [weak self] in self?.cancelDismiss() }
         host.container.onExit = { [weak self] in self?.scheduleDismiss() }
@@ -146,11 +147,8 @@ final class ResourceDetailCoordinator {
         attachPanel(to: parentWindow)
         positionPanel(beside: anchor, primaryView: primaryView,
                       parentWindow: parentWindow, section: section)
-        if activate {
-            panel.makeKeyAndOrderFront(nil)
-        } else {
-            panel.orderFront(nil)
-        }
+        // 固定详情不主动从一级弹窗抢走 key window；二级分段控件被点击时仍可按需成为 key。
+        panel.orderFront(nil)
     }
 
     /// 离开一级行或二级浮层后等待 250ms，允许指针穿过两个窗口之间的窄间隙。
@@ -229,13 +227,13 @@ final class ResourceDetailCoordinator {
         panel.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
     }
 
-    /// 趋势固定在排行上方；磁盘三图保留更多高度，电源突出系统耗电，实际尺寸仍受屏幕限制。
+    /// CPU 与内存增加排行可视高度；电源同时容纳电量历史和功率曲线，实际尺寸仍受屏幕限制。
     private func fixedHeight(for section: ResourceSection) -> CGFloat {
         switch section {
-        case .cpu, .memory: return 490
+        case .cpu, .memory: return 590
         case .network: return 510
         case .disk: return 650
-        case .power: return 450
+        case .power: return 650
         case .fan: return 300
         }
     }
