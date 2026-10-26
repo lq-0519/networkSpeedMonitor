@@ -1,7 +1,7 @@
 import Foundation
 import SQLite3
 
-/// 所有新增资源曲线共用的四个时间窗口；不改变底层采样频率，首次展示默认一分钟。
+/// 所有自行采集的资源曲线共用的四个时间窗口；不改变底层采样频率，首次展示默认十分钟。
 enum TrendRange: Int, CaseIterable {
     /// 保留最近一分钟的真实采样细节。
     case minute = 60
@@ -11,6 +11,10 @@ enum TrendRange: Int, CaseIterable {
     case hour = 3600
     /// 查看本应用保留的最近二十四小时。
     case day = 86400
+
+    /// 所有自行采集的资源趋势首次展示及关闭一级弹窗后统一使用十分钟。
+    /// 控制器和图表共用此默认值，分段按钮按实际范围定位，不依赖选项排列顺序。
+    static let defaultRange: TrendRange = .tenMinutes
 
     /// 原生分段控件中的固定名称。
     var title: String {
@@ -42,6 +46,10 @@ enum TrendMetric: Int, CaseIterable {
     var column: String { "v\(rawValue)" }
     /// 位图区分本轮未采集与已采集但无效的 NULL，后者必须使曲线断开。
     var mask: Int64 { Int64(1) << rawValue }
+
+    /// 已用容量与风扇转速按可见窗口的真实极值确定纵轴，因此查询及实时缓存保留完整标量。
+    /// 绘图仍可压缩；旧极值滑出窗口后，未被压缩丢弃的其余样本可准确给出新的上下限。
+    var usesWindowBounds: Bool { self == .diskUsed || rawValue >= Self.fan0.rawValue }
 
     /// 将合法 SMC 编号映射到固定列，不为异常数量创建无限列或缓存。
     static func fan(_ index: Int) -> TrendMetric? {
@@ -261,7 +269,7 @@ final class TrendHistoryStore {
                     let previous = sorted[index - 1]
                     sorted[index].breakBefore = sorted[index].time - previous.time > max(3, previous.spacing * 3)
                 }
-                series[metric] = metric == .diskUsed || sorted.count <= 800
+                series[metric] = metric.usesWindowBounds || sorted.count <= 800
                     ? sorted : TrendDownsampler.reduce(sorted, since: start, range: range)
             }
             let snapshot = TrendSnapshot(series: series, watermark: nextID, error: error)

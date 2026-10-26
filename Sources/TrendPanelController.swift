@@ -6,8 +6,8 @@ private enum TrendAxis {
     case percent
     /// 内存固定零至本机物理总量。
     case memory
-    /// 普通速度、功率或转速从零开始，按窗口峰值扩展。
-    case positive
+    /// 所有风扇共用窗口内真实最小最大转速，不强制从零开始，便于比较细微变化。
+    case fan
     /// 多项功率共用瓦特坐标；电池放电可低于零，输入与系统耗电保持正值。
     case signed
     /// 已用容量紧贴窗口真实最小最大值，不强制从零开始。
@@ -38,8 +38,8 @@ final class ResourceTrendController: NSViewController {
     private let ranking: NSViewController?
     /// 电源独有的系统电量历史，和功率趋势在同一个详情中上下排列。
     private let batteryHistory: PowerHistoryPanelController?
-    /// 新曲线固定四档，初次及关闭一级弹窗后恢复一分钟。
-    private var range: TrendRange = .minute
+    /// 自行采集的曲线固定四档，初次及关闭一级弹窗后统一恢复十分钟。
+    private var range: TrendRange = .defaultRange
     /// 不同来源的真实曲线点，隐藏时释放，不缓存二十四小时的所有资源。
     private var series: [TrendMetric: [TrendPoint]] = [:]
     /// 当前快照包含的最后一个采样标识，实时通知据此去重。
@@ -82,7 +82,7 @@ final class ResourceTrendController: NSViewController {
         case .power: return [TrendChartSpec(title: "功率对比",
                                             metrics: [.systemPower, .inputPower, .batteryPower],
                                             axis: .signed, height: 190)]
-        case .fan: return [TrendChartSpec(title: "风扇转速", metrics: (0..<10).compactMap(TrendMetric.fan), axis: .positive, height: 210)]
+        case .fan: return [TrendChartSpec(title: "风扇转速", metrics: (0..<10).compactMap(TrendMetric.fan), axis: .fan, height: 210)]
         }
     }
 
@@ -102,7 +102,8 @@ final class ResourceTrendController: NSViewController {
         ])
         let title = NSTextField(labelWithString: section == .power ? "功率趋势" : "\(section.title)趋势")
         title.font = .systemFont(ofSize: 13, weight: .semibold)
-        rangeControl.controlSize = .small; rangeControl.selectedSegment = 0
+        rangeControl.controlSize = .small
+        rangeControl.selectedSegment = TrendRange.allCases.firstIndex(of: range) ?? -1
         rangeControl.target = self; rangeControl.action = #selector(changeRange)
         rangeControl.setAccessibilityLabel("\(section.title)趋势时间范围")
         let header = NSStackView(views: [title, NSView(), rangeControl])
@@ -159,12 +160,12 @@ final class ResourceTrendController: NSViewController {
         }
     }
 
-    /// 关闭一级弹窗后重置功率趋势和系统电量历史各自的默认范围。
+    /// 关闭一级弹窗后将当前资源趋势恢复十分钟，并重置系统电量历史自身的默认范围。
     func resetRange() {
-        range = .minute
+        range = .defaultRange
         batteryHistory?.resetRange()
         if isViewLoaded {
-            rangeControl.selectedSegment = 0
+            rangeControl.selectedSegment = TrendRange.allCases.firstIndex(of: range) ?? -1
         }
     }
 
@@ -189,8 +190,8 @@ final class ResourceTrendController: NSViewController {
         }
         for metric in metrics {
             let points = (series[metric] ?? []).filter { $0.time >= start && $0.time <= end }
-            // 容量保留完整标量，以便滑动窗口的上下限始终来自窗口内真实最小最大值。
-            series[metric] = metric == .diskUsed || points.count <= 800
+            // 容量与风扇保留完整标量，以便滑动窗口的上下限始终来自窗口内真实最小最大值。
+            series[metric] = metric.usesWindowBounds || points.count <= 800
                 ? points : TrendDownsampler.reduce(points, since: start, range: range)
         }
         render()
@@ -230,12 +231,12 @@ private final class TrendChartView: NSView {
     var onHoverTime: ((TimeInterval?) -> Void)?
     /// 固定的指标、纵轴和标题配置。
     private let specification: TrendChartSpec
-    /// 可见曲线的真实显示点；容量纵轴另从完整标量计算。
+    /// 可见曲线的真实显示点；容量与风扇纵轴另从完整标量计算。
     private var series: [TrendMetric: [TrendPoint]] = [:]
     /// 当前图形纵轴最小最大值，不随鼠标移动重新计算。
     private var limits: (low: Double, high: Double) = (0, 1)
-    /// 固定四档窗口及其真实右边界。
-    private var range: TrendRange = .minute
+    /// 固定四档窗口，初始范围与资源控制器统一默认十分钟。
+    private var range: TrendRange = .defaultRange
     /// 横轴右边界的 Unix 秒。
     private var end: TimeInterval = 0
     /// 初次读取状态与空历史分别展示。
@@ -279,9 +280,10 @@ private final class TrendChartView: NSView {
         case .memory: limits = (0, Double(ProcessInfo.processInfo.physicalMemory))
         case .mirrored: let peak = max(1024, maximum); limits = (-peak, peak)
         case .signed: limits = (min(0, minimum), max(1, maximum))
-        case .positive: limits = (0, max(1, maximum))
-        case .capacity:
-            let padding = max(50_000_000, abs(minimum) * 0.00001)
+        case .capacity, .fan:
+            // 非恒定数据严格使用窗口极值；恒定数据才按容量字节或转速单位扩展，避免零跨度。
+            let padding = specification.axis == .capacity
+                ? max(50_000_000, abs(minimum) * 0.00001) : max(1, abs(minimum) * 0.001)
             limits = maximum > minimum ? (minimum, maximum) : (max(0, minimum - padding), maximum + padding)
         }
         setAccessibilityValue(specification.metrics.compactMap { metric in
@@ -311,9 +313,21 @@ private final class TrendChartView: NSView {
     /// 指针移出后恢复最新读数，不保留过期悬停位置。
     override func mouseExited(with event: NSEvent) { onHoverTime?(nil) }
 
-    /// 原生线条与轻量面积填充，下载/读取向上、上传/写入向下；缺失和生命周期分段均断线。
+    /// 外观变化时主动重绘自绘文字和线条，持续打开的详情也立即使用新的深浅模式配色。
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    /// 在本视图的实际外观中解析全部动态系统色，避免透明浮层中的坐标使用浅色模式文字色。
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
+        effectiveAppearance.performAsCurrentDrawingAppearance { drawChart() }
+    }
+
+    /// 原生线条与轻量面积填充，下载/读取向上、上传/写入向下；缺失和生命周期分段均断线。
+    /// 调用方已设置当前绘制外观，轴文字、图例、网格和悬停读数均在同一外观中绘制。
+    private func drawChart() {
         drawText(specification.title, rect: NSRect(x: 0, y: bounds.maxY - 16, width: 145, height: 14), color: .labelColor, weight: .medium)
         let active = specification.metrics.filter { (series[$0] ?? []).contains { $0.value != nil } }
         let readout = NSMutableAttributedString(string: "")
@@ -342,7 +356,8 @@ private final class TrendChartView: NSView {
             let line = NSBezierPath(); line.move(to: NSPoint(x: plot.minX, y: y)); line.line(to: NSPoint(x: plot.maxX, y: y))
             line.lineWidth = 0.5; line.stroke()
             drawText(format(abs(value), metric: axisMetric, signed: specification.axis == .signed && value < 0),
-                     rect: NSRect(x: 0, y: y - 6, width: plot.minX - 6, height: 12), alignment: .right)
+                     rect: NSRect(x: 0, y: y - 6, width: plot.minX - 6, height: 12),
+                     color: .labelColor, weight: .medium, alignment: .right)
         }
         timeFormatter.dateFormat = range == .minute ? "HH:mm:ss" : (range == .day ? "M/d HH:mm" : "HH:mm")
         for fraction in [0.0, 0.5, 1.0] {
@@ -351,7 +366,7 @@ private final class TrendChartView: NSView {
             let width: CGFloat = 60
             let origin = fraction == 0 ? x : (fraction == 1 ? x - width : x - width / 2)
             drawText(timeFormatter.string(from: Date(timeIntervalSince1970: time)), rect: NSRect(x: origin, y: 0, width: width, height: 14),
-                     alignment: fraction == 1 ? .right : (fraction == 0 ? .left : .center))
+                     color: .labelColor, alignment: fraction == 1 ? .right : (fraction == 0 ? .left : .center))
         }
         guard !active.isEmpty else {
             drawText(loading ? "正在读取趋势…" : "暂无这段时间的记录", rect: NSRect(x: plot.minX, y: plot.midY - 7, width: plot.width, height: 16), alignment: .center)

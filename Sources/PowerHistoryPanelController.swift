@@ -186,9 +186,21 @@ private final class PowerHistoryChartView: NSView {
                 y: plot.minY + CGFloat(sample.percent / 100) * plot.height)
     }
 
-    /// 绘制网格、系统供电/休眠区间和电量曲线；空历史只显示状态文字。
+    /// 外观变化时主动刷新自绘图表，使已打开的系统电量历史无需重新查询即可切换配色。
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    /// 在本视图的实际外观中解析动态系统色，避免二级透明浮层中的坐标文字颜色过暗。
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
+        effectiveAppearance.performAsCurrentDrawingAppearance { drawChart() }
+    }
+
+    /// 绘制网格、系统供电/休眠区间和电量曲线；空历史只显示状态文字。
+    /// 调用方已设置当前绘制外观，坐标、图例和悬停读数使用一致的深浅模式配色。
+    private func drawChart() {
         guard let snapshot else {
             drawText(message, at: NSPoint(x: max(0, (bounds.width - textWidth(message)) / 2), y: bounds.midY - 7))
             return
@@ -199,7 +211,7 @@ private final class PowerHistoryChartView: NSView {
             NSColor.separatorColor.withAlphaComponent(0.45).setStroke()
             let line = NSBezierPath(); line.move(to: NSPoint(x: plot.minX, y: y))
             line.line(to: NSPoint(x: plot.maxX, y: y)); line.lineWidth = 0.5; line.stroke()
-            drawText("\(value)%", at: NSPoint(x: plot.minX - textWidth("\(value)%") - 5, y: y - 6))
+            drawText("\(value)%", at: NSPoint(x: plot.minX - textWidth("\(value)%") - 5, y: y - 6), color: .labelColor)
         }
         // 一小时每十分钟标注一次；其余范围保留既有时间或日期刻度。
         let ticks = range == .week ? 7 : (range == .hour ? 6 : 5)
@@ -208,7 +220,7 @@ private final class PowerHistoryChartView: NSView {
             let time = snapshot.start + Double(index) / Double(ticks) * (snapshot.end - snapshot.start)
             let label = axisFormatter.string(from: Date(timeIntervalSince1970: time))
             let x = plot.minX + CGFloat(index) / CGFloat(ticks) * plot.width
-            drawText(label, at: NSPoint(x: min(bounds.maxX - textWidth(label), max(0, x - textWidth(label) / 2)), y: 5))
+            drawText(label, at: NSPoint(x: min(bounds.maxX - textWidth(label), max(0, x - textWidth(label) / 2)), y: 5), color: .labelColor)
         }
         NSGraphicsContext.saveGraphicsState()
         NSBezierPath(rect: plot.insetBy(dx: -1, dy: -2)).addClip()
