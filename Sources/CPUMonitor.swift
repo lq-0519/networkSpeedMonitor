@@ -44,12 +44,22 @@ final class CPUMonitor {
     private(set) var isRankingStale = false
     /// 仅在排行内容或状态变化时递增，整机数字刷新不触发表格重建。
     private(set) var rankingRevision = 0
+    /// 最近成功快照的单调时刻，用于诊断当前排行的数据年龄。
+    private(set) var rankingSampleTime: TimeInterval?
+    /// 最近成功请求从发送到解码完成的总等待时长，包含服务启动及传输。
+    private(set) var rankingRequestDuration: TimeInterval?
+    /// 服务实际枚举进程的耗时；旧服务未提供该字段时保持 nil。
+    private(set) var rankingCollectionDuration: TimeInterval?
     /// 整机 CPU 与进程排行使用全应用统一间隔，不再单独读取旧 CPU 偏好。
     var interval: Int { SamplingPreferences.interval }
-    /// 所有底层计数器、连接、计时器与差分状态仅由此串行队列读写。
-    private let queue = DispatchQueue(label: "com.local.NetworkSpeedMonitor.cpu", qos: .utility)
+    /// 低成本整机统计独立运行，不被普通权限进程枚举或应用归类阻塞。
+    private let systemQueue = DispatchQueue(label: "com.local.NetworkSpeedMonitor.cpu.system", qos: .utility)
+    /// 仅在用户查看详情时工作，低优先级串行计算；主线程只接收最终排行。
+    private let rankingQueue = DispatchQueue(label: "com.local.NetworkSpeedMonitor.cpu.ranking", qos: .utility)
     /// 整机和详情共用一个带容差的定时器，避免重复唤醒。
     private var timer: DispatchSourceTimer?
+    /// 仅由 systemQueue 访问；详情关闭后不再向排行队列投递周期性空任务。
+    private var rankingEnabled = false
     /// 四个整机状态计数器。
     private let systemReader = CPUSystemReader()
     /// 未授权时仍可显示当前用户的进程，并明确标注覆盖不足。
@@ -58,7 +68,7 @@ final class CPUMonitor {
     private let accumulator = CPUUsageAccumulator()
     /// 经过双向签名验证的按需管理员连接。
     private let client = CPUPrivilegedClient()
-    /// 应用归属缓存仅在主线程上使用。
+    /// 应用归属缓存仅由 rankingQueue 使用，首次读取 App 元数据也不会阻塞界面。
     private let resolver = ApplicationResolver()
     /// 主线程上的面板可见状态。
     private var visible = false
@@ -90,11 +100,11 @@ final class CPUMonitor {
         let epoch = UUID(); systemEpoch = epoch
         let paused = suspended, seconds = interval
         onSystemReset?(paused)
-        queue.async { [self] in
+        systemQueue.async { [self] in
             timer?.cancel(); timer = nil; systemReader.reset()
             guard !paused else { return }
             _ = systemReader.sample()
-            let source = DispatchSource.makeTimerSource(queue: queue)
+            let source = DispatchSource.makeTimerSource(queue: systemQueue)
             source.schedule(deadline: .now() + .seconds(seconds), repeating: .seconds(seconds), leeway: .milliseconds(150))
             source.setEventHandler { [weak self] in
                 guard let self else { return }
@@ -105,7 +115,9 @@ final class CPUMonitor {
                     self.onSystemSample?(value, sampledAt, uptime, seconds)
                     self.usage = value; self.onUpdate?()
                 }
-                self.sampleRanking()
+                if self.rankingEnabled {
+                    self.rankingQueue.async { [weak self] in self?.sampleRanking() }
+                }
             }
             timer = source; source.resume()
         }
@@ -134,14 +146,15 @@ final class CPUMonitor {
         let enabled = visible && !suspended, helper = CPUPrivilege.isInstalled
         trace("configure visible=\(visible) suspended=\(suspended) helper=\(helper) epoch=\(epoch)")
         applications = []; readableProcesses = 0; deniedProcesses = 0; privileged = false
+        rankingSampleTime = nil; rankingRequestDuration = nil; rankingCollectionDuration = nil
         collectionStatus = enabled ? .sampling : .paused
         rankingStatus = collectionStatus.message; isRankingStale = false
         rankingRevision += 1
         onProcessSnapshot?(nil, collectionStatus)
-        resolver.clear()
-        queue.async { [self] in
+        systemQueue.async { [self] in rankingEnabled = enabled }
+        rankingQueue.async { [self] in
             pending?.delayed.cancel(); pending?.timeout.cancel(); pending = nil
-            client.close(); accumulator.reset(); localReader.reset()
+            client.close(); accumulator.reset(); localReader.reset(); resolver.clear()
             helperReady = false; retryFailures = 0; retryNotBefore = 0
             rankingRequest = enabled ? (epoch, helper) : nil
             if enabled { sampleRanking() }
@@ -154,7 +167,7 @@ final class CPUMonitor {
         guard let request = rankingRequest, pending == nil,
               ProcessInfo.processInfo.systemUptime >= retryNotBefore else { return }
         if !request.helper { receive(localReader.snapshot(), epoch: request.epoch); return }
-        let id = UUID()
+        let id = UUID(), began = ProcessInfo.processInfo.systemUptime
         let delayed = DispatchWorkItem { [weak self] in
             guard let self, self.pending?.id == id else { return }
             self.publishStatus(.retrying("采集延迟，正在等待服务响应。"), epoch: request.epoch)
@@ -165,18 +178,19 @@ final class CPUMonitor {
             self.scheduleRetry(.retrying("采集超时，正在自动重试。"), epoch: request.epoch)
         }
         pending = (id, delayed, timeout)
-        queue.asyncAfter(deadline: .now() + CPURequestTiming.delayedAfter, execute: delayed)
-        queue.asyncAfter(deadline: .now() + (helperReady ? CPURequestTiming.sampleTimeout : CPURequestTiming.startupTimeout),
+        rankingQueue.asyncAfter(deadline: .now() + CPURequestTiming.delayedAfter, execute: delayed)
+        rankingQueue.asyncAfter(deadline: .now() + (helperReady ? CPURequestTiming.sampleTimeout : CPURequestTiming.startupTimeout),
                          execute: timeout)
         client.read { [weak self] result in
             guard let self else { return }
-            self.queue.async { [weak self] in
+            let duration = ProcessInfo.processInfo.systemUptime - began
+            self.rankingQueue.async { [weak self] in
                 guard let self, self.pending?.id == id, self.rankingRequest?.epoch == request.epoch else { return }
                 self.pending?.delayed.cancel(); self.pending?.timeout.cancel(); self.pending = nil
                 switch result {
                 case .success(let snapshot):
                     self.helperReady = true; self.retryFailures = 0; self.retryNotBefore = 0
-                    self.receive(snapshot, epoch: request.epoch)
+                    self.receive(snapshot, epoch: request.epoch, requestDuration: duration)
                 case .failure(let error):
                     if let validation = error as? CPUServiceValidationError {
                         self.client.close(); self.helperReady = false; self.accumulator.reset()
@@ -199,48 +213,56 @@ final class CPUMonitor {
         publishStatus(status, epoch: epoch)
     }
 
-    /// 从累计快照计算占用，主线程只执行应用归类和可见 UI 更新。
-    private func receive(_ snapshot: CPUProcessSnapshot, epoch: UUID) {
+    /// 差分和应用归类在排行队列完成；主线程仅提交结果，避免千余进程首次归类冻结界面。
+    private func receive(_ snapshot: CPUProcessSnapshot, epoch: UUID, requestDuration: TimeInterval? = nil) {
         let values = accumulator.consume(snapshot)
-        trace("receive time=\(snapshot.uptime) cores=\(snapshot.cores) usages=\(values?.count ?? -1) epoch=\(epoch)")
+        let groups = values.map { groupedApplications($0) }
+        trace("receive time=\(snapshot.uptime) request=\(requestDuration ?? -1) collection=\(snapshot.collectionDuration ?? -1) cores=\(snapshot.cores) usages=\(values?.count ?? -1) epoch=\(epoch)")
         DispatchQueue.main.async { [weak self] in
             guard let self, self.rankingEpoch == epoch else { return }
             self.privileged = snapshot.privileged
+            self.rankingSampleTime = snapshot.uptime
+            self.rankingRequestDuration = requestDuration
+            self.rankingCollectionDuration = snapshot.collectionDuration
             self.readableProcesses = snapshot.processes.count; self.deniedProcesses = snapshot.denied
             self.collectionStatus = .live
             self.onProcessSnapshot?(snapshot, .live)
-            guard let values else {
+            guard let values, let groups else {
                 self.isRankingStale = !self.applications.isEmpty
                 self.rankingStatus = self.isRankingStale ? "最近结果已过期，正在重新采样。" : "正在采样…"
                 self.rankingRevision += 1
                 self.onUpdate?()
                 return
             }
-            var grouped: [String: CPUApplicationUsage] = [:]
-            for value in values {
-                let process = value.process
-                let app = self.resolver.resolve(path: process.path, pid: process.pid, fallback: process.name)
-                var item = grouped[app.key] ?? CPUApplicationUsage(key: app.key, name: app.name,
-                    bundlePath: app.bundle, percent: 0, processCount: 0, processes: [])
-                item.percent += value.percent; item.processCount += 1
-                item.processes.append(value); grouped[app.key] = item
-            }
-            // 先汇总完整占用，再保留最多五十个应用供设置即时切换；子进程明细仍有界为十项。
-            let top = grouped.values.sorted {
-                $0.percent == $1.percent ? $0.name.localizedStandardCompare($1.name) == .orderedAscending : $0.percent > $1.percent
-            }.prefix(RankingPreferences.maximumCount)
-            self.applications = top.map { item in
-                var result = item
-                result.processes = Array(item.processes.sorted {
-                    $0.percent == $1.percent ? $0.process.pid < $1.process.pid : $0.percent > $1.percent
-                }.prefix(10))
-                return result
-            }
+            self.applications = groups
             self.isRankingStale = false
             self.rankingStatus = values.isEmpty ? "当前没有可比较的进程样本" : "实时"
             self.trace("publish groups=\(self.applications.count) epoch=\(epoch)")
             self.rankingRevision += 1
             self.onUpdate?()
+        }
+    }
+
+    /// 完整汇总后再截取五十个应用和每项十个子进程，保持原有排行口径及设置即时切换能力。
+    private func groupedApplications(_ values: [CPUProcessUsage]) -> [CPUApplicationUsage] {
+        var grouped: [String: CPUApplicationUsage] = [:]
+        for value in values {
+            let process = value.process
+            let app = resolver.resolve(path: process.path, pid: process.pid, fallback: process.name)
+            var item = grouped[app.key] ?? CPUApplicationUsage(key: app.key, name: app.name,
+                bundlePath: app.bundle, percent: 0, processCount: 0, processes: [])
+            item.percent += value.percent; item.processCount += 1
+            item.processes.append(value); grouped[app.key] = item
+        }
+        let top = grouped.values.sorted {
+            $0.percent == $1.percent ? $0.name.localizedStandardCompare($1.name) == .orderedAscending : $0.percent > $1.percent
+        }.prefix(RankingPreferences.maximumCount)
+        return top.map { item in
+            var result = item
+            result.processes = Array(item.processes.sorted {
+                $0.percent == $1.percent ? $0.process.pid < $1.process.pid : $0.percent > $1.percent
+            }.prefix(10))
+            return result
         }
     }
 
@@ -265,10 +287,11 @@ final class CPUMonitor {
     /// 退出时同步释放计时器与 XPC 连接，后台服务随后按空闲期限结束。
     func shutdown() {
         systemEpoch = UUID(); rankingEpoch = UUID()
-        queue.sync {
-            timer?.cancel(); timer = nil; rankingRequest = nil
+        systemQueue.sync { timer?.cancel(); timer = nil; rankingEnabled = false }
+        rankingQueue.sync {
+            rankingRequest = nil
             pending?.delayed.cancel(); pending?.timeout.cancel(); pending = nil
-            client.close(); localReader.reset(); accumulator.reset()
+            client.close(); localReader.reset(); accumulator.reset(); resolver.clear()
         }
     }
 }

@@ -367,9 +367,31 @@ enum Diagnostics {
               "短暂重连后 CPU 使用真实间隔差分，不把保留的旧样本显示成新峰值")
         check(preservedCPU.consume(snapshot(360, ticks: 96_000_000)) == nil,
               "超过三十秒的恢复首帧仍只建立 CPU 基线")
+        let nanosecondCPU = CPUUsageAccumulator()
+        _ = nanosecondCPU.consume(snapshot(400, ticks: 24_000_000))
+        /// 模拟不同时间基准，验证异常或未来服务切换计数单位时重建基线，保持整机归一化口径。
+        func nanosecondSnapshot(_ time: Double, ticks: UInt64) -> CPUProcessSnapshot {
+            CPUProcessSnapshot(version: 1, uptime: time, cores: 4, secondsPerTick: 1e-9,
+                privileged: true, denied: 0, skipped: 0,
+                processes: [CPUProcessCounter(pid: 12, started: 10, ticks: ticks, name: "test", path: "")])
+        }
+        check(nanosecondCPU.consume(nanosecondSnapshot(402, ticks: 1_000_000_000)) == nil,
+              "服务切换计数单位时重建 CPU 基线，不跨单位差分")
+        check(abs((nanosecondCPU.consume(nanosecondSnapshot(404, ticks: 3_000_000_000))?.first?.percent ?? -1)
+                  - 25) < 0.00001, "CPU 时间按快照提供的换算因子、实际间隔及核心数正确归一化")
+        check(legacy.collectionDuration == nil, "旧服务缺少采集耗时仍可正常解码")
         let recoveryMemory = MemoryMonitor()
         recoveryMemory.setVisible(true)
-        recoveryMemory.receive(decodedMemory, status: .live)
+        /// 等待后台排行在主线程提交，检查最终数据状态，避免把队列尚未执行误判成采集失败。
+        func awaitMemoryPublication(_ action: () -> Void) {
+            let revision = recoveryMemory.rankingRevision
+            action()
+            let end = Date().addingTimeInterval(5)
+            while recoveryMemory.rankingRevision == revision && Date() < end {
+                RunLoop.main.run(until: min(end, Date().addingTimeInterval(0.01)))
+            }
+        }
+        awaitMemoryPublication { recoveryMemory.receive(decodedMemory, status: .live) }
         let lastMemory = recoveryMemory.applications.first?.footprintBytes
         recoveryMemory.receive(nil, status: recovering)
         check(recoveryMemory.isRankingStale && recoveryMemory.privileged && recoveryMemory.supported
@@ -377,7 +399,7 @@ enum Diagnostics {
               && recoveryMemory.rankingStatus.contains("过期")
               && !recoveryMemory.collectionStatus.requiresAuthorization,
               "内存超时保留旧排行及已验证权限，并明确显示过期")
-        recoveryMemory.receive(decodedMemory, status: .live)
+        awaitMemoryPublication { recoveryMemory.receive(decodedMemory, status: .live) }
         check(!recoveryMemory.isRankingStale && recoveryMemory.rankingStatus == "实时",
               "内存新快照到达立即取消过期标记")
         recoveryMemory.receive(legacy, status: .live)
@@ -392,22 +414,30 @@ enum Diagnostics {
               "关闭内存详情清空过期结果并拒绝迟到快照")
         let recoveryDisk = DiskMonitor()
         recoveryDisk.setVisible(true)
-        recoveryDisk.receive(diskSnapshot(300, read: 1000, write: 2000), status: .live)
-        recoveryDisk.receive(diskSnapshot(302, read: 5000, write: 8000), status: .live)
+        /// 等待后台磁盘差分结果提交，再检查过期保留和恢复行为。
+        func awaitDiskPublication(_ value: CPUProcessSnapshot) {
+            recoveryDisk.receive(value, status: .live)
+            let end = Date().addingTimeInterval(5)
+            while recoveryDisk.sampleTime != value.uptime && Date() < end {
+                RunLoop.main.run(until: min(end, Date().addingTimeInterval(0.01)))
+            }
+        }
+        awaitDiskPublication(diskSnapshot(300, read: 1000, write: 2000))
+        awaitDiskPublication(diskSnapshot(302, read: 5000, write: 8000))
         let lastDiskRead = recoveryDisk.applications.first?.read
         recoveryDisk.receive(nil, status: recovering)
         check(recoveryDisk.isRankingStale && recoveryDisk.privileged && recoveryDisk.supported
               && recoveryDisk.applications.first?.read == lastDiskRead
               && !recoveryDisk.collectionStatus.requiresAuthorization,
               "磁盘超时保留最近读写与权限，避免误报需要授权")
-        recoveryDisk.receive(diskSnapshot(314, read: 29000, write: 44000), status: .live)
+        awaitDiskPublication(diskSnapshot(314, read: 29000, write: 44000))
         check(!recoveryDisk.isRankingStale && recoveryDisk.applications.first?.read == 2000,
               "短暂故障恢复后磁盘继续按真实间隔计算，不额外丢弃首帧")
         recoveryDisk.receive(nil, status: recovering)
-        recoveryDisk.receive(diskSnapshot(360, read: 40000, write: 50000), status: .live)
+        awaitDiskPublication(diskSnapshot(360, read: 40000, write: 50000))
         check(recoveryDisk.isRankingStale && recoveryDisk.applications.first?.read == 2000,
               "长缺口恢复的磁盘首帧保留旧结果并继续标注过期")
-        recoveryDisk.receive(diskSnapshot(362, read: 46000, write: 60000), status: .live)
+        awaitDiskPublication(diskSnapshot(362, read: 46000, write: 60000))
         check(!recoveryDisk.isRankingStale && recoveryDisk.applications.first?.read == 3000,
               "长缺口恢复的磁盘第二帧替换旧结果并取消过期标记")
         recoveryDisk.receive(nil, status: .authorizationRequired)
@@ -616,6 +646,9 @@ enum Diagnostics {
             let result: [String: Any] = ["cpu_percent": usage.total, "user_percent": usage.user,
                 "system_percent": usage.system, "privileged": monitor.privileged,
                 "readable_processes": monitor.readableProcesses, "denied_processes": monitor.deniedProcesses,
+                "ranking_request_seconds": monitor.rankingRequestDuration ?? -1,
+                "ranking_collection_seconds": monitor.rankingCollectionDuration ?? -1,
+                "ranking_age_seconds": monitor.rankingSampleTime.map { max(0, ProcessInfo.processInfo.systemUptime - $0) } ?? -1,
                 "ranking_status": monitor.rankingStatus, "applications": rows]
             if let data = try? JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]),
                let line = String(data: data, encoding: .utf8) { print(line); fflush(stdout) }

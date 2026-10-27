@@ -3,7 +3,7 @@ import Darwin
 
 /// 按需启动的只读服务；没有界面、网络、文件写入或执行任意命令的接口。
 final class CPUHelper: NSObject, NSXPCListenerDelegate, CPUServiceProtocol {
-    /// 唯一采集队列，多个连接也不会并发枚举全机进程。
+    /// 低优先级串行采集，优先减少查询成本，不持续与前台任务争夺 CPU。
     private let queue = DispatchQueue(label: CPUServiceIdentity.label, qos: .utility)
     /// 当前存活的连接数，修改仅在 queue 上执行。
     private var connections = 0
@@ -46,7 +46,7 @@ final class CPUHelper: NSObject, NSXPCListenerDelegate, CPUServiceProtocol {
         }
     }
 
-    /// 主程序关闭面板或退出后延迟 10 秒退出，短时间重新展开时避免反复启动服务。
+    /// 关闭后立即释放排行缓存，空闲十秒退出，限制仅为再次展开而保留的后台内存。
     private func armIdleExit() {
         idleExit?.cancel()
         reader.reset(); cached = nil

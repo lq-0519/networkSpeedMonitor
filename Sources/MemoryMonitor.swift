@@ -182,7 +182,11 @@ final class MemoryMonitor {
     private let systemReader = MemorySystemReader()
     /// GUI 由趋势采集器提供整机标量；独立诊断沿用原有直接读取行为。
     private let systemManagedExternally: Bool
-    /// 复用 CPU 和磁盘相同的最外层 App 归属规则。
+    /// 仅在详情可见时以低优先级执行归类和排序，避免阻塞主线程或持续抢占前台 CPU。
+    private let rankingQueue = DispatchQueue(label: "com.local.NetworkSpeedMonitor.memory.ranking", qos: .utility)
+    /// 主线程更新的发布世代，关闭、重开或更新采集状态后拒绝旧的后台计算结果。
+    private var processingEpoch = UUID()
+    /// 复用 CPU 和磁盘相同的最外层 App 归属规则，缓存只在 rankingQueue 访问。
     private let resolver = ApplicationResolver()
 
     /// 仅 GUI 开启共享整机采集，默认参数保持既有诊断调用兼容。
@@ -211,6 +215,7 @@ final class MemoryMonitor {
     /// 接收 CPU 同轮的进程 rusage；普通权限展示部分结果，旧管理员服务明确要求更新。
     func receive(_ snapshot: CPUProcessSnapshot?, status: ProcessCollectionStatus) {
         guard visible else { return }
+        let epoch = UUID(); processingEpoch = epoch
         if !systemManagedExternally { systemUsage = systemReader.sample() }
         guard let snapshot else {
             if status.preservesResult {
@@ -224,6 +229,23 @@ final class MemoryMonitor {
             onUpdate?()
             return
         }
+        guard let processes = snapshot.memoryProcesses else {
+            rankingQueue.async { [self] in resolver.clear() }
+            publish(snapshot, applications: [], epoch: epoch)
+            return
+        }
+        rankingQueue.async { [weak self] in
+            guard let self else { return }
+            let groups = self.groupedApplications(processes)
+            DispatchQueue.main.async { [weak self] in
+                self?.publish(snapshot, applications: groups, epoch: epoch)
+            }
+        }
+    }
+
+    /// 后台结果只在对应详情及采集世代仍有效时提交，覆盖信息和排行在同一轮主线程更新中生效。
+    private func publish(_ snapshot: CPUProcessSnapshot, applications groups: [MemoryApplicationUsage], epoch: UUID) {
+        guard visible, processingEpoch == epoch else { return }
         collectionStatus = .live
         isRankingStale = false
         privileged = snapshot.privileged
@@ -232,15 +254,19 @@ final class MemoryMonitor {
         deniedProcesses = snapshot.memoryDenied ?? 0
         skippedProcesses = snapshot.memorySkipped ?? 0
         sampleTime = snapshot.uptime
-        guard let processes = snapshot.memoryProcesses else {
-            resolver.clear()
-            applications = []
+        applications = groups
+        if snapshot.memoryProcesses == nil {
             collectionStatus = .updateRequired
             rankingStatus = collectionStatus.message
-            rankingRevision += 1
-            onUpdate?()
-            return
+        } else {
+            rankingStatus = snapshot.memoryProcesses?.isEmpty == true ? "当前没有可读取的进程" : privileged ? "实时" : "部分进程"
         }
+        rankingRevision += 1
+        onUpdate?()
+    }
+
+    /// 在独立串行队列中完整合并 footprint，再保留有界应用和子进程明细。
+    private func groupedApplications(_ processes: [MemoryProcessCounter]) -> [MemoryApplicationUsage] {
         var grouped: [String: MemoryApplicationUsage] = [:]
         for process in processes {
             let app = resolver.resolve(path: process.path, pid: process.pid, fallback: process.name)
@@ -257,21 +283,19 @@ final class MemoryMonitor {
                 ? $0.name.localizedStandardCompare($1.name) == .orderedAscending
                 : $0.footprintBytes > $1.footprintBytes
         }.prefix(RankingPreferences.maximumCount)
-        applications = top.map { item in
+        return top.map { item in
             var result = item
             result.processes = Array(item.processes.sorted {
                 $0.footprintBytes == $1.footprintBytes ? $0.pid < $1.pid : $0.footprintBytes > $1.footprintBytes
             }.prefix(10))
             return result
         }
-        rankingStatus = processes.isEmpty ? "当前没有可读取的进程" : privileged ? "实时" : "部分进程"
-        rankingRevision += 1
-        onUpdate?()
     }
 
     /// 关闭、确定的校验失败或详情重配时清空排行；暂时延迟通过 receive 保留最近结果。
     private func clearRanking(_ status: ProcessCollectionStatus) {
-        resolver.clear()
+        processingEpoch = UUID()
+        rankingQueue.async { [self] in resolver.clear() }
         applications = []
         privileged = false
         supported = false

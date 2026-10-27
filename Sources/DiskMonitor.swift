@@ -87,9 +87,13 @@ final class DiskMonitor {
     private(set) var sampleTime: TimeInterval?
     /// 关闭后拒绝 CPU 已经排队的旧回调。
     private var visible = false
-    /// 磁盘和 CPU 采用各自的差分器，互不改变统计窗口。
+    /// 按需差分和 App 元数据读取在低优先级队列串行执行，不阻塞界面或持续抢占前台 CPU。
+    private let rankingQueue = DispatchQueue(label: "com.local.NetworkSpeedMonitor.disk.ranking", qos: .utility)
+    /// 主线程上的结果世代；状态变化和关闭后拒绝已经排队的旧排行。
+    private var processingEpoch = UUID()
+    /// 磁盘和 CPU 采用各自的差分器，仅由 rankingQueue 访问，互不改变统计窗口。
     private let accumulator = DiskUsageAccumulator()
-    /// 复用现有 App 合并规则，缓存仅在详情可见期间保留。
+    /// 复用现有 App 合并规则，缓存仅在详情可见期间保留，并且只在 rankingQueue 访问。
     private let resolver = ApplicationResolver()
     /// GUI 容量由共享轻量采集器读取；诊断默认继续自行读取。
     private let systemManagedExternally: Bool
@@ -130,6 +134,7 @@ final class DiskMonitor {
     /// 接收同一轮管理员 CPU/磁盘快照；不显示普通权限的局部磁盘排行冒充完整覆盖。
     func receive(_ snapshot: CPUProcessSnapshot?, status: ProcessCollectionStatus) {
         guard visible else { return }
+        let epoch = UUID(); processingEpoch = epoch
         if !systemManagedExternally { capacity = DiskCapacity.read() }
         guard let snapshot else {
             if status.preservesResult {
@@ -142,6 +147,24 @@ final class DiskMonitor {
             onUpdate?()
             return
         }
+        rankingQueue.async { [weak self] in
+            guard let self else { return }
+            let groups: [DiskApplicationUsage]?
+            if snapshot.privileged && snapshot.diskProcesses != nil {
+                groups = self.accumulator.consume(snapshot).map { self.groupedApplications($0) }
+            } else {
+                self.accumulator.reset(); self.resolver.clear()
+                groups = nil
+            }
+            DispatchQueue.main.async { [weak self] in
+                self?.publish(snapshot, applications: groups, epoch: epoch)
+            }
+        }
+    }
+
+    /// 同时提交采样时间、覆盖信息和排行；过期任务不能覆盖更新后的状态或重新打开的面板。
+    private func publish(_ snapshot: CPUProcessSnapshot, applications groups: [DiskApplicationUsage]?, epoch: UUID) {
+        guard visible, processingEpoch == epoch else { return }
         collectionStatus = .live
         privileged = snapshot.privileged
         supported = snapshot.diskProcesses != nil
@@ -151,12 +174,20 @@ final class DiskMonitor {
         sampleTime = snapshot.uptime
         guard privileged else { reject(.authorizationRequired); return }
         guard supported else { reject(.updateRequired); return }
-        guard let values = accumulator.consume(snapshot) else {
+        guard let groups else {
             isRankingStale = !applications.isEmpty
             rankingStatus = isRankingStale ? "最近结果已过期，正在重新采样。" : "正在采样…"
             onUpdate?()
             return
         }
+        applications = groups
+        isRankingStale = false
+        rankingStatus = applications.contains { $0.read + $0.write > 0 } ? "实时" : "当前没有活跃的磁盘读写"
+        onUpdate?()
+    }
+
+    /// 后台完整聚合读写速度，主线程仍按用户设置对最终应用排行排序。
+    private func groupedApplications(_ values: [DiskProcessUsage]) -> [DiskApplicationUsage] {
         var grouped: [String: DiskApplicationUsage] = [:]
         for value in values {
             let process = value.process
@@ -166,22 +197,21 @@ final class DiskMonitor {
             item.read += value.read; item.write += value.write; item.processes += 1
             grouped[app.key] = item
         }
-        applications = Array(grouped.values)
-        isRankingStale = false
-        rankingStatus = applications.contains { $0.read + $0.write > 0 } ? "实时" : "当前没有活跃的磁盘读写"
-        onUpdate?()
+        return Array(grouped.values)
     }
 
     /// 权限或旧协议不能继续显示上次成功的冻结数值，但保留本轮实际覆盖信息。
     private func reject(_ status: ProcessCollectionStatus) {
-        accumulator.reset(); resolver.clear(); applications = []
+        applications = []
         collectionStatus = status; isRankingStale = false
         rankingStatus = status.message; onUpdate?()
     }
 
     /// 关闭、确定的校验失败或重配时释放排行；暂时超时不会清除数据与差分基线。
     private func clear(_ status: ProcessCollectionStatus) {
-        accumulator.reset(); resolver.clear(); applications = []
+        processingEpoch = UUID()
+        rankingQueue.async { [self] in accumulator.reset(); resolver.clear() }
+        applications = []
         privileged = false; supported = false; readableProcesses = 0
         deniedProcesses = 0; skippedProcesses = 0; sampleTime = nil
         collectionStatus = status; isRankingStale = false; rankingStatus = status.message

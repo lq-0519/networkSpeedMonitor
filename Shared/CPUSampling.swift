@@ -3,10 +3,22 @@ import Darwin
 
 /// 读取系统已维护的计数器；无抓取线程、无历史日志、无外部命令。
 final class CPUProcessReader {
-    /// 以 PID 和启动时间缓存可执行路径，只为新进程查询路径。
-    private var paths: [String: String] = [:]
-    /// 本机 absolute tick 的换算因子，仅初始化一次。
+    /// 以 PID 缓存元数据，并同时验证启动时刻和可执行映像，避免 PID 重用或 exec 后错误归属。
+    private var metadata: [Int32: ProcessMetadata] = [:]
+    /// 本机 absolute tick 的换算因子；rusage 与 task 回退均使用同一时间单位。
     private let secondsPerTick: Double
+
+    /// 不随每轮占用变化的进程元数据；映像 UUID 变化时重新查询名称和路径。
+    private struct ProcessMetadata {
+        /// rusage 提供的进程启动时刻，用于检测 PID 重用。
+        let started: UInt64
+        /// 当前可执行映像的 UUID，用于检测原 PID 上的 exec。
+        let executable: UUID
+        /// 内核提供的进程名称，失败时保留可读的 PID 文本。
+        let name: String
+        /// 可执行路径；受保护进程可为空，不猜测应用归属。
+        let path: String
+    }
 
     /// 从内核读取时间基准，不硬编码 Intel 或 Apple Silicon 时钟频率。
     init() {
@@ -15,29 +27,24 @@ final class CPUProcessReader {
         secondsPerTick = Double(info.numer) / Double(info.denom) / 1_000_000_000
     }
 
-    /// 单次枚举 PID 后读取 CPU 及共享的 rusage 计数；磁盘和内存复用同一查询，不增加系统调用。
+    /// CPU、磁盘和内存复用一次 rusage 查询；正常路径不再逐进程读取需要汇总线程的 TASKALLINFO。
     func snapshot() -> CPUProcessSnapshot {
+        let began = ProcessInfo.processInfo.systemUptime
         let capacity = min(131_072, max(1024, Int(proc_listallpids(nil, 0)) + 256))
         var pids = [Int32](repeating: 0, count: capacity)
         let count = pids.withUnsafeMutableBytes { Int(proc_listallpids($0.baseAddress, Int32($0.count))) }
-        var processes: [CPUProcessCounter] = [], nextPaths: [String: String] = [:]
+        var processes: [CPUProcessCounter] = [], nextMetadata: [Int32: ProcessMetadata] = [:]
         var denied = 0, skipped = 0, diskDenied = 0, diskSkipped = 0
         var memoryDenied = 0, memorySkipped = 0
         var diskProcesses: [DiskProcessCounter] = []
         var memoryProcesses: [MemoryProcessCounter] = []
         for pid in pids.prefix(max(0, min(count, capacity))) {
-            var info = proc_taskallinfo()
-            let size = Int32(MemoryLayout<proc_taskallinfo>.size)
-            let received = proc_pidinfo(pid, PROC_PIDTASKALLINFO, 0, &info, size)
-            let cpuReadable = received == size
-            if !cpuReadable {
-                if errno == EPERM || errno == EACCES { denied += 1 } else { skipped += 1 }
-            }
             var usage = rusage_info_v2()
             let rusageReadable = withUnsafeMutablePointer(to: &usage) {
                 $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(pid, RUSAGE_INFO_V2, $0) == 0 }
             }
             if !rusageReadable {
+                // 先保存 rusage 的权限状态，后续 CPU 回退查询会改变 errno。
                 if errno == EPERM || errno == EACCES {
                     diskDenied += 1
                     memoryDenied += 1
@@ -45,49 +52,64 @@ final class CPUProcessReader {
                     diskSkipped += 1
                     memorySkipped += 1
                 }
+                // kernel_task 等不支持 rusage 的进程仍沿用原 CPU 接口，不减少原有 CPU 覆盖范围。
+                if let process = fallbackCPU(pid: pid) { processes.append(process) }
+                else if errno == EPERM || errno == EACCES { denied += 1 }
+                else { skipped += 1 }
+                continue
             }
-            guard cpuReadable || rusageReadable else { continue }
-            let start = info.pbsd.pbi_start_tvsec * 1_000_000 + info.pbsd.pbi_start_tvusec
-            let identity = rusageReadable ? "rusage:\(pid):\(usage.ri_proc_start_abstime)" : "cpu:\(pid):\(start)"
-            let name: String
-            if cpuReadable {
-                name = withUnsafePointer(to: &info.pbsd.pbi_name) {
-                    $0.withMemoryRebound(to: CChar.self, capacity: 32) { String(cString: $0) }
-                }
+            let executable = UUID(uuid: usage.ri_uuid)
+            let item: ProcessMetadata
+            if let cached = metadata[pid], cached.started == usage.ri_proc_start_abstime,
+               cached.executable == executable {
+                item = cached
             } else {
                 var buffer = [CChar](repeating: 0, count: 1024)
-                name = proc_name(pid, &buffer, UInt32(buffer.count)) > 0 ? String(cString: buffer) : ""
+                let name = proc_name(pid, &buffer, UInt32(buffer.count)) > 0 ? String(cString: buffer) : ""
+                var pathBuffer = [CChar](repeating: 0, count: 4096)
+                let path = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count)) > 0 ? String(cString: pathBuffer) : ""
+                item = ProcessMetadata(started: usage.ri_proc_start_abstime, executable: executable,
+                    name: name.isEmpty ? (pid == 0 ? "kernel_task" : "进程 \(pid)") : name, path: path)
             }
-            let path: String
-            if let cached = paths[identity] { path = cached }
-            else {
-                var buffer = [CChar](repeating: 0, count: 4096)
-                path = proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 ? String(cString: buffer) : ""
-            }
-            nextPaths[identity] = path
-            let title = name.isEmpty ? (pid == 0 ? "kernel_task" : "进程 \(pid)") : name
-            if cpuReadable {
-                processes.append(CPUProcessCounter(pid: pid, started: start,
-                    ticks: info.ptinfo.pti_total_user &+ info.ptinfo.pti_total_system, name: title, path: path))
-            }
-            if rusageReadable {
-                diskProcesses.append(DiskProcessCounter(pid: pid, started: usage.ri_proc_start_abstime,
-                    readBytes: usage.ri_diskio_bytesread, writtenBytes: usage.ri_diskio_byteswritten, name: title, path: path))
-                memoryProcesses.append(MemoryProcessCounter(pid: pid, started: usage.ri_proc_start_abstime,
-                    footprintBytes: usage.ri_phys_footprint, name: title, path: path))
-            }
+            nextMetadata[pid] = item
+            let total = usage.ri_user_time.addingReportingOverflow(usage.ri_system_time)
+            processes.append(CPUProcessCounter(pid: pid, started: item.started,
+                ticks: total.overflow ? UInt64.max : total.partialValue, name: item.name, path: item.path))
+            diskProcesses.append(DiskProcessCounter(pid: pid, started: item.started,
+                readBytes: usage.ri_diskio_bytesread, writtenBytes: usage.ri_diskio_byteswritten, name: item.name, path: item.path))
+            memoryProcesses.append(MemoryProcessCounter(pid: pid, started: item.started,
+                footprintBytes: usage.ri_phys_footprint, name: item.name, path: item.path))
         }
-        paths = nextPaths
+        metadata = nextMetadata
+        let completed = ProcessInfo.processInfo.systemUptime
         return CPUProcessSnapshot(version: CPUServiceIdentity.protocolVersion,
-            uptime: ProcessInfo.processInfo.systemUptime, cores: ProcessInfo.processInfo.activeProcessorCount,
+            uptime: completed, cores: ProcessInfo.processInfo.activeProcessorCount,
             secondsPerTick: secondsPerTick, privileged: geteuid() == 0,
             denied: denied, skipped: skipped, processes: processes,
             diskProcesses: diskProcesses, diskDenied: diskDenied, diskSkipped: diskSkipped,
-            memoryProcesses: memoryProcesses, memoryDenied: memoryDenied, memorySkipped: memorySkipped)
+            memoryProcesses: memoryProcesses, memoryDenied: memoryDenied, memorySkipped: memorySkipped,
+            collectionDuration: completed - began)
+    }
+
+    /// 仅为 rusage 失败的进程回退；两种接口均返回 Mach ticks，不能将累计值误当成纳秒。
+    private func fallbackCPU(pid: Int32) -> CPUProcessCounter? {
+        var info = proc_taskallinfo()
+        let size = Int32(MemoryLayout<proc_taskallinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTASKALLINFO, 0, &info, size) == size else { return nil }
+        let name = withUnsafePointer(to: &info.pbsd.pbi_name) {
+            $0.withMemoryRebound(to: CChar.self, capacity: 32) { String(cString: $0) }
+        }
+        var buffer = [CChar](repeating: 0, count: 4096)
+        let path = proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 ? String(cString: buffer) : ""
+        let ticks = info.ptinfo.pti_total_user.addingReportingOverflow(info.ptinfo.pti_total_system)
+        return CPUProcessCounter(pid: pid,
+            started: info.pbsd.pbi_start_tvsec * 1_000_000 + info.pbsd.pbi_start_tvusec,
+            ticks: ticks.overflow ? UInt64.max : ticks.partialValue,
+            name: name.isEmpty ? (pid == 0 ? "kernel_task" : "进程 \(pid)") : name, path: path)
     }
 
     /// 关闭详情时回收进程元数据，不在常驻状态保存完整进程表。
-    func reset() { paths.removeAll() }
+    func reset() { metadata.removeAll() }
 }
 
 /// 整机 CPU 的本周期占比，用户态与系统态均已按全部核心归一化。

@@ -3,8 +3,8 @@
 <plist version="1.0"><dict>
     <key>CFBundleIdentifier</key><string>com.local.NetworkSpeedMonitor.CPUHelper</string>
     <key>CFBundleName</key><string>CPU 内存与磁盘只读采集服务</string>
-    <key>CFBundleVersion</key><string>6</string>
-    <key>CFBundleShortVersionString</key><string>1.3.0</string>
+    <key>CFBundleVersion</key><string>7</string>
+    <key>CFBundleShortVersionString</key><string>1.4.0</string>
     <key>SMAuthorizedClients</key><array>
         <string>identifier "com.local.NetworkSpeedMonitor" and certificate root = H"659A2CD838DF7ADCB88F313BDE6572A223C4923C"</string>
     </array>

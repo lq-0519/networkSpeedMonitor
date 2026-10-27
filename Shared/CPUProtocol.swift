@@ -26,9 +26,9 @@ enum CPUServiceIdentity {
 struct CPUProcessCounter: Codable {
     /// 系统进程标识，包含内核进程 PID 0。
     let pid: Int32
-    /// 进程创建时刻，单位为 Unix 微秒。
+    /// 进程创建身份；rusage 使用 Mach 启动时刻，旧接口回退使用 Unix 微秒，仅比较同源值。
     let started: UInt64
-    /// 用户态与内核态累计 CPU 时间，单位为 Mach absolute ticks。
+    /// 用户态与内核态累计 CPU 时间，rusage 与 task 接口均使用 Mach absolute ticks。
     let ticks: UInt64
     /// 内核提供的显示名称，不依赖主程序能否读取受限进程元数据。
     let name: String
@@ -68,6 +68,8 @@ struct CPUProcessSnapshot: Codable {
     var memoryDenied: Int? = nil
     /// 内存采样期间退出或暂时不可读的进程数，与权限失败分别展示。
     var memorySkipped: Int? = nil
+    /// 仅包含服务端进程枚举与计数读取的耗时；旧服务缺省，诊断可与客户端等待时长区分。
+    var collectionDuration: TimeInterval? = nil
 }
 
 /// 内核归属到单个进程的当前物理内存占用；使用 footprint 避免把共享页和虚拟地址空间直接相加。
@@ -161,9 +163,10 @@ final class CPUUsageAccumulator {
     func consume(_ snapshot: CPUProcessSnapshot) -> [CPUProcessUsage]? {
         let old = previous
         previous = snapshot
-        guard let old, snapshot.cores == old.cores, snapshot.privileged == old.privileged else { return nil }
+        guard let old, snapshot.cores == old.cores, snapshot.privileged == old.privileged,
+              snapshot.secondsPerTick == old.secondsPerTick else { return nil }
         let duration = snapshot.uptime - old.uptime
-        guard duration >= 0.1, duration <= 30, snapshot.cores > 0,
+        guard duration.isFinite, duration >= 0.1, duration <= 30, snapshot.cores > 0,
               snapshot.secondsPerTick > 0, snapshot.secondsPerTick.isFinite else { return nil }
         let counters = Dictionary(old.processes.map { ($0.identity, $0.ticks) }, uniquingKeysWith: { _, new in new })
         return snapshot.processes.compactMap { process in

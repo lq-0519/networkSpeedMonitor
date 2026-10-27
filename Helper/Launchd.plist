@@ -3,6 +3,7 @@
 <plist version="1.0"><dict>
     <key>Label</key><string>com.local.NetworkSpeedMonitor.CPUHelper</string>
     <key>MachServices</key><dict><key>com.local.NetworkSpeedMonitor.CPUHelper</key><true/></dict>
-    <key>ProcessType</key><string>Background</string>
+    <!-- 随 XPC 请求活动在交互与后台分类之间调整，空闲时保持后台资源限制。 -->
+    <key>ProcessType</key><string>Adaptive</string>
     <key>ThrottleInterval</key><integer>2</integer>
 </dict></plist>
