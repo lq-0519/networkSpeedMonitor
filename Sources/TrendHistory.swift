@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import SQLite3
 
 /// 所有自行采集的资源曲线共用的四个时间窗口；不改变底层采样频率，首次展示默认十分钟。
@@ -173,6 +174,9 @@ final class TrendHistoryStore {
     private var timer: DispatchSourceTimer?
     /// 最近成功清理的单调时刻，系统校时不改变每小时清理节奏。
     private var lastCleanup: TimeInterval = 0
+    /// 仅在实际尝试清理时记录统一日志，成功使用 notice 级别以便事后查询。
+    /// 不在每分钟的节流检查或每个采样点输出日志，不增加常驻定时器和独立日志文件。
+    private let logger = Logger(subsystem: "com.local.NetworkSpeedMonitor", category: "trend-history")
     /// 最近批量写入失败时向可见页面说明持久化受限，内存中的实时曲线仍继续工作。
     private var writeFailed = false
     /// 只有当前可见趋势需要的列才投递主线程通知，隐藏时不为历史存储额外唤醒 UI。
@@ -374,14 +378,29 @@ final class TrendHistoryStore {
     }
 
     /// 启动与每小时删除过期行，重用空闲页；不在采样路径执行全库 VACUUM。
+    /// 每次实际尝试记录清理时刻、删除条数和单调时钟耗时；失败记录 SQLite 原因并保留原重试节奏。
     private func cleanup(now: TimeInterval) {
         let uptime = ProcessInfo.processInfo.systemUptime
         guard let database, lastCleanup == 0 || uptime - lastCleanup >= 3600 else { return }
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(database, "DELETE FROM samples WHERE time < ?", -1, &statement, nil) == SQLITE_OK,
-              let statement else { return }
-        defer { sqlite3_finalize(statement) }
-        sqlite3_bind_double(statement, 1, now - Self.retention)
-        if sqlite3_step(statement) == SQLITE_DONE { lastCleanup = uptime }
+        var status = sqlite3_prepare_v2(database, "DELETE FROM samples WHERE time < ?", -1, &statement, nil)
+        defer {
+            let durationMilliseconds = (ProcessInfo.processInfo.systemUptime - uptime) * 1000
+            let cleanupTime = ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: now))
+            // 在 finalize 前读取受影响行数和错误，避免后续 SQLite 调用覆盖本次清理的结果。
+            if status == SQLITE_DONE {
+                let deletedRows = sqlite3_changes(database)
+                logger.notice("History cleanup succeeded: time=\(cleanupTime, privacy: .public) deleted_rows=\(deletedRows) duration_ms=\(durationMilliseconds)")
+            } else {
+                let message = String(cString: sqlite3_errmsg(database))
+                logger.error("History cleanup failed: time=\(cleanupTime, privacy: .public) deleted_rows=0 duration_ms=\(durationMilliseconds) sqlite_code=\(status) error=\(message, privacy: .public)")
+            }
+            if let statement { sqlite3_finalize(statement) }
+        }
+        guard status == SQLITE_OK, let statement else { return }
+        status = sqlite3_bind_double(statement, 1, now - Self.retention)
+        guard status == SQLITE_OK else { return }
+        status = sqlite3_step(statement)
+        if status == SQLITE_DONE { lastCleanup = uptime }
     }
 }
