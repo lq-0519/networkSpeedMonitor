@@ -74,7 +74,8 @@ final class OverviewPanelController: NSViewController {
             .cpu: ResourceTrendController(section: .cpu, history: history, ranking: cpuPanel),
             .memory: ResourceTrendController(section: .memory, history: history, ranking: memoryPanel),
             .disk: ResourceTrendController(section: .disk, history: history, ranking: diskPanel),
-            .power: ResourceTrendController(section: .power, history: history, batteryHistory: powerHistoryPanel),
+            .power: ResourceTrendController(section: .power, history: history, batteryHistory: powerHistoryPanel,
+                                             powerFlow: PowerFlowPanelController(monitor: power)),
             .fan: ResourceTrendController(section: .fan, history: history)
         ]
         super.init(nibName: nil, bundle: nil)
@@ -122,6 +123,7 @@ final class OverviewPanelController: NSViewController {
         }
         detailCoordinator.onPresent = { [weak self] section in self?.refreshDetail(section) }
         detailCoordinator.onDismiss = { [weak self] section in self?.releaseDetail(section) }
+        trendPanels[.power]?.onLayoutChange = { [weak self] in self?.detailCoordinator.reposition() }
         detailCoordinator.onPinChange = { [weak self] section in
             self?.resourceOverview.setPinnedSection(section)
             self?.powerPanel.setPinned(section == .power)
@@ -211,8 +213,12 @@ final class OverviewPanelController: NSViewController {
         if detailCoordinator.visibleSection == .memory { memoryPanel.refresh() }
     }
 
-    /// 电源更新只触达固定指标区域，菜单栏与四类排行均不受影响。
-    func refreshPower() { guard isViewLoaded else { return }; powerPanel.refresh() }
+    /// 电源更新只触达一级指标与当前可见的顶部流向图，不查询电量历史或刷新隐藏详情。
+    func refreshPower() {
+        guard isViewLoaded else { return }
+        powerPanel.refresh()
+        if detailCoordinator.visibleSection == .power { trendPanels[.power]?.refreshPowerFlow() }
+    }
 
     /// 风扇更新只刷新紧凑转速区域，并按实际硬件数量控制显示。
     func refreshFans() { guard isViewLoaded else { return }; fanPanel.refresh() }

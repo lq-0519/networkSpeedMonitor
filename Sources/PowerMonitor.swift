@@ -22,6 +22,8 @@ struct PowerSnapshot: Codable {
     let batteryWatts: Double?
     /// 适配器报告的标称或协商功率，与实际输入功率独立展示。
     let adapterWatts: Double?
+    /// 接电时的适配器效率损耗估算；遥测按毫瓦换算，位于 Mac 输入上游，不计入内部部件或差额。
+    let adapterLossWatts: Double?
     /// 当前供电模式下的系统剩余时间估算，单位为分钟；负值和哨兵值不会保留。
     let minutes: Int?
     /// 当前满充容量相对设计容量的估算百分比，不冒充系统设置的校准健康度。
@@ -106,6 +108,7 @@ enum PowerReader {
         return PowerSnapshot(percent: percent, external: external, charging: charging, charged: charged,
             optimized: optimized, inputWatts: input, systemWatts: load, batteryWatts: battery,
             adapterWatts: external ? number(adapter["Watts"]).flatMap { $0 > 0 ? $0 : nil } : nil,
+            adapterLossWatts: external && fresh ? watts(telemetry["AdapterEfficiencyLoss"]) : nil,
             minutes: external && (!charging || charged || optimized) ? nil : minutes,
             health: health, cycles: number(raw["CycleCount"]).flatMap { $0 >= 0 ? Int($0) : nil },
             updatedAt: updated, estimated: estimated)
@@ -134,6 +137,8 @@ final class PowerMonitor {
     private(set) var snapshot: PowerSnapshot?
     /// 与电源同轮读取的风扇快照；nil 表示 SMC 接口不可用，空数组表示无风扇。
     private(set) var fanSnapshot: FanSnapshot?
+    /// 部件功耗只随一级弹窗的可见采样更新，不交给后台趋势库或菜单栏。
+    private(set) var componentSnapshot: PowerComponentSnapshot?
     /// 与网络和 CPU 共用的间隔；面板隐藏时只读取配置，不启动采样。
     var interval: Int { SamplingPreferences.interval }
     /// 主线程上的可见状态，重复设置不会重建计时器。
@@ -144,6 +149,10 @@ final class PowerMonitor {
     private let queue = DispatchQueue(label: "com.local.NetworkSpeedMonitor.power", qos: .utility)
     /// 仅在弹窗打开期间存在的计时器，周期取自统一采样偏好。
     private var timer: DispatchSourceTimer?
+    /// 可见期间的定向能耗订阅，只由串行采样队列持有，收起后释放订阅和差分基线。
+    private var components: PowerComponentReader?
+    /// 可见期间风扇与屏幕共用的 SMC 连接，避免逐轮重复打开用户客户端。
+    private var smc: SMCReadConnection?
 
     /// 打开立即采样，随后按统一周期读取；关闭立即失效并清理队列中的定时器。
     func setVisible(_ value: Bool) {
@@ -153,22 +162,27 @@ final class PowerMonitor {
 
     /// 设置修改时重建当前可见采样并失效旧回调；面板隐藏时仅取消旧任务，不创建计时器。
     func restart() {
-        epoch = UUID(); snapshot = nil; fanSnapshot = nil
+        epoch = UUID(); snapshot = nil; fanSnapshot = nil; componentSnapshot = nil
         let current = epoch
         let enabled = visible, seconds = interval
         queue.async { [self] in
             timer?.cancel(); timer = nil
+            components = nil; smc?.close(); smc = nil
             guard enabled else { return }
+            components = PowerComponentReader()
+            smc = SMCReadConnection.open()
             let source = DispatchSource.makeTimerSource(queue: queue)
             source.schedule(deadline: .now(), repeating: .seconds(seconds), leeway: .milliseconds(150))
             source.setEventHandler { [weak self] in
                 let sampledAt = Date()
                 let snapshot = PowerReader.read()
-                let fanSnapshot = FanReader.read()
+                let fanSnapshot = self?.smc.map { FanReader.read(using: $0) } ?? nil
+                let componentSnapshot = self?.components?.sample(smc: self?.smc, external: snapshot?.external)
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.visible, self.epoch == current else { return }
                     self.onSample?(snapshot, fanSnapshot, sampledAt, seconds)
-                    self.snapshot = snapshot; self.fanSnapshot = fanSnapshot; self.onUpdate?()
+                    self.snapshot = snapshot; self.fanSnapshot = fanSnapshot
+                    self.componentSnapshot = componentSnapshot; self.onUpdate?()
                 }
             }
             timer = source; source.resume()
@@ -178,6 +192,7 @@ final class PowerMonitor {
     /// 退出时同步取消采样，不保留进程、连接或后台工作。
     func shutdown() {
         visible = false; epoch = UUID()
-        queue.sync { timer?.cancel(); timer = nil }
+        componentSnapshot = nil
+        queue.sync { timer?.cancel(); timer = nil; components = nil; smc?.close(); smc = nil }
     }
 }

@@ -202,7 +202,8 @@ final class ResourceDetailCoordinator {
         parentWindow.addChildWindow(panel, ordered: .above)
     }
 
-    /// 优先贴合一级内容右侧，空间不足时自动贴到左侧，并按当前详情固定十行高度。
+    /// 优先贴合一级内容右侧，空间不足时自动贴到左侧；电源按全部内容高度展开。
+    /// 下边缘触及屏幕可用区域时将整个面板上移，让新增高度向上延伸并保留底部内容。
     private func positionPanel(beside anchor: NSView, primaryView: NSView,
                                parentWindow: NSWindow, section: ResourceSection) {
         let anchorInWindow = anchor.convert(anchor.bounds, to: nil)
@@ -214,7 +215,15 @@ final class ResourceDetailCoordinator {
         let margin: CGFloat = 8
         let gap: CGFloat = 0
         let width: CGFloat = 420
-        let height = min(fixedHeight(for: section), max(300, visibleFrame.height - margin * 2))
+        let maximumHeight = max(300, visibleFrame.height - margin * 2)
+        let height: CGFloat
+        if section == .power, let controller = controllers[section] as? ResourceTrendController {
+            // 宿主上下各 14pt；只压缩绘图区，标题、摘要和范围控件始终参与内容高度计算。
+            let contentHeight = controller.fitPowerContent(maximumHeight: maximumHeight - 28)
+            height = min(maximumHeight, ceil(contentHeight + 28))
+        } else {
+            height = min(fixedHeight(for: section), maximumHeight)
+        }
         // OverviewPanelController.view 的边界不包含 NSPopover 窗口的透明箭头和阴影区域。
         let rightX = primaryOnScreen.maxX + gap
         let leftX = primaryOnScreen.minX - gap - width
@@ -227,7 +236,7 @@ final class ResourceDetailCoordinator {
         panel.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
     }
 
-    /// CPU 与内存增加排行可视高度；电源同时容纳电量历史和功率曲线，实际尺寸仍受屏幕限制。
+    /// 非电源资源沿用原有排行和曲线高度；电源正常呈现由实际内容高度决定。
     private func fixedHeight(for section: ResourceSection) -> CGFloat {
         switch section {
         case .cpu, .memory: return 590

@@ -2,10 +2,18 @@ import AppKit
 
 /// 电源二级详情只展示系统电量曲线及两项摘要，不创建应用耗电排行或历史采集器。
 final class PowerHistoryPanelController: NSViewController {
+    /// 空间充足时的电量绘图区高度；外层详情另外按实际字体尺寸计算标题与摘要高度。
+    static let preferredChartHeight: CGFloat = 218
+    /// 屏幕较矮时仍给百分比刻度、时间轴和曲线保留可辨识的绘图区。
+    static let minimumChartHeight: CGFloat = 80
     /// 历史模型独立于实时功率，仅在本详情可见时读取系统数据库。
     private let monitor = PowerHistoryMonitor()
     /// 轻量 AppKit 曲线视图，没有动画或 UI 刷新计时器。
     private let chart = PowerHistoryChartView(frame: .zero)
+    /// 标题、曲线和摘要的纵向布局，用于按当前字体测量完整内容高度。
+    private let contentStack = NSStackView()
+    /// 只有呈现或屏幕空间变化时调整曲线高度，历史采样不触发布局压缩。
+    private var chartHeightConstraint: NSLayoutConstraint?
     /// 电池供电时间按系统记录区间推算，未知值保持破折号。
     private let duration = NSTextField(labelWithString: "—")
     /// 电池供电期间下降的百分点之和，与充电回升分别统计。
@@ -33,16 +41,19 @@ final class PowerHistoryPanelController: NSViewController {
         let separator = NSBox(); separator.boxType = .separator
         let summary = NSStackView(views: [metric("电池供电", value: duration), metric("累计下降", value: decline)])
         summary.distribution = .fillEqually; summary.spacing = 16
-        let root = NSStackView(views: [header, chart, separator, summary])
+        let root = contentStack
+        for row in [header, chart, separator, summary] { root.addArrangedSubview(row) }
         root.orientation = .vertical; root.alignment = .leading; root.spacing = 10
         root.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(root)
+        let chartHeight = chart.heightAnchor.constraint(equalToConstant: Self.preferredChartHeight)
+        chartHeightConstraint = chartHeight
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             root.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             root.topAnchor.constraint(equalTo: view.topAnchor),
-            root.bottomAnchor.constraint(lessThanOrEqualTo: view.bottomAnchor),
-            chart.heightAnchor.constraint(equalToConstant: 218),
+            root.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            chartHeight,
             separator.heightAnchor.constraint(equalToConstant: 1)
         ])
         for row in root.arrangedSubviews { row.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true }
@@ -50,6 +61,19 @@ final class PowerHistoryPanelController: NSViewController {
         decline.toolTip = "按系统记录推算电池供电期间下降的百分点累计；接电区间与电量回升不计入。"
         monitor.onUpdate = { [weak self] in self?.refresh() }
         refresh()
+    }
+
+    /// 设置绘图区高度并返回包含标题、分隔线和两项摘要的完整高度；不读取历史或刷新数据。
+    /// 分别测量非曲线行，避免外层窗口上一次的高度干扰本次自然内容高度计算。
+    func setChartHeight(_ requestedHeight: CGFloat) -> CGFloat {
+        _ = view
+        let height = min(Self.preferredChartHeight, max(Self.minimumChartHeight, requestedHeight))
+        chartHeightConstraint?.constant = height
+        let rows = contentStack.arrangedSubviews
+        let rowHeight = rows.reduce(CGFloat.zero) { total, row in
+            total + (row === chart ? height : row.fittingSize.height)
+        }
+        return rowHeight + contentStack.spacing * CGFloat(max(0, rows.count - 1))
     }
 
     /// 协调器呈现和关闭详情时调用；一级概览可见及实时功率刷新均不会触发历史查询。

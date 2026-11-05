@@ -26,7 +26,11 @@ enum FanReader {
     static func read() -> FanSnapshot? {
         guard let smc = SMCReadConnection.open() else { return nil }
         defer { smc.close() }
+        return read(using: smc)
+    }
 
+    /// 可见弹窗的风扇与屏幕功率复用同一只读连接；连接归调用者所有，本方法不创建或关闭端口。
+    static func read(using smc: SMCReadConnection) -> FanSnapshot? {
         let reportedCount = smc.readNumber("FNum").flatMap(validFanCount)
         if let count = reportedCount {
             let fans = (0..<count).map { index in
@@ -170,10 +174,14 @@ private struct SMCRawValue {
     let bytes: [UInt8]
 }
 
-/// 每次采样使用的只读 AppleSMC 短连接，析构时兜底关闭 Mach 端口。
-private final class SMCReadConnection {
+/// 只读 AppleSMC 连接；后台单次读取立即关闭，可见弹窗复用连接并在收起时关闭 Mach 端口。
+final class SMCReadConnection {
     /// 当前 IOKit 用户客户端连接；关闭后置零防止重复释放。
     private var connection: io_connect_t
+    /// 已知键的编码信息在连接内最多缓存三十二项，避免每轮重复询问固件，关闭连接时释放。
+    private var metadata: [UInt32: SMCKeyInfoData] = [:]
+    /// 缺失的已知键同样记忆，屏幕等不支持的字段不会在每个可见采样周期重复探测。
+    private var unavailableKeys = Set<UInt32>()
 
     /// 仅允许 open() 在 IOServiceOpen 成功后创建有效连接。
     private init(connection: io_connect_t) { self.connection = connection }
@@ -200,6 +208,7 @@ private final class SMCReadConnection {
         guard connection != 0 else { return }
         IOServiceClose(connection)
         connection = 0
+        metadata.removeAll(); unavailableKeys.removeAll()
     }
 
     /// 先查询 key 元信息，再读取有效字节；仅调用 AppleSMC 的 readKeyInfo 与 readBytes 命令。
@@ -209,12 +218,21 @@ private final class SMCReadConnection {
         var input = SMCKeyData()
         var output = SMCKeyData()
         input.key = characters.reduce(0) { ($0 << 8) | UInt32($1) }
-        input.command = 9
-        guard call(input: &input, output: &output) == kIOReturnSuccess,
-              output.result == 0, output.keyInfo.dataSize > 0,
-              output.keyInfo.dataSize <= 32, output.keyInfo.dataType != 0 else { return nil }
-
-        let info = output.keyInfo
+        guard !unavailableKeys.contains(input.key) else { return nil }
+        let info: SMCKeyInfoData
+        if let cached = metadata[input.key] {
+            info = cached
+        } else {
+            input.command = 9
+            guard call(input: &input, output: &output) == kIOReturnSuccess,
+                  output.result == 0, output.keyInfo.dataSize > 0,
+                  output.keyInfo.dataSize <= 32, output.keyInfo.dataType != 0 else {
+                if unavailableKeys.count < 32 { unavailableKeys.insert(input.key) }
+                return nil
+            }
+            info = output.keyInfo
+            if metadata.count < 32 { metadata[input.key] = info }
+        }
         input.keyInfo.dataSize = info.dataSize
         input.command = 5
         output = SMCKeyData()

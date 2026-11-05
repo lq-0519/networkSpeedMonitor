@@ -13,6 +13,18 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/network-speed-build.XXXXXX")"
 trap 'rm -rf "$BUILD_DIR"' EXIT
 
+# 安装、启动和自检分别控制；显式要求不执行测试时仍保留编译与签名校验。
+INSTALL_ACTION=""
+# 默认维持原有自检行为，仅 --skip-self-check 明确跳过应用诊断入口。
+RUN_SELF_CHECK=true
+for argument in "$@"; do
+    case "$argument" in
+        --install|--run) INSTALL_ACTION="$argument" ;;
+        --skip-self-check) RUN_SELF_CHECK=false ;;
+        *) echo "未知构建参数：$argument" >&2; exit 1 ;;
+    esac
+done
+
 if ! /usr/bin/security find-identity -v -p codesigning | /usr/bin/grep -Fq "$SIGNING_IDENTITY"; then
     echo "缺少固定签名证书 InputHoldSwitcher Local Code Signing。" >&2
     exit 1
@@ -47,9 +59,11 @@ cp "$PROJECT_DIR/PrivacyInfo.xcprivacy" "$APP_DIR/Contents/Resources/PrivacyInfo
 /usr/bin/codesign --force --timestamp=none --sign "$SIGNING_IDENTITY" "$APP_DIR"
 /usr/bin/codesign --verify --deep --strict \
     -R "=identifier \"$BUNDLE_ID\" and certificate root = H\"$SIGNING_IDENTITY\"" "$APP_DIR"
-"$APP_DIR/Contents/MacOS/NetworkSpeedMonitor" --self-check
+if [[ "$RUN_SELF_CHECK" == true ]]; then
+    "$APP_DIR/Contents/MacOS/NetworkSpeedMonitor" --self-check
+fi
 
-if [[ "${1:-}" == "--install" || "${1:-}" == "--run" ]]; then
+if [[ "$INSTALL_ACTION" == "--install" || "$INSTALL_ACTION" == "--run" ]]; then
     # 更新前校验已有安装身份，防止意外覆盖同名的其他软件。
     if [[ -e "$INSTALL_PATH" ]]; then
         /usr/bin/codesign --verify --deep --strict \
@@ -77,7 +91,7 @@ if [[ "${1:-}" == "--install" || "${1:-}" == "--run" ]]; then
     fi
     /usr/bin/codesign --verify --deep --strict "$INSTALL_PATH"
     echo "已安装：$INSTALL_PATH"
-    if [[ "${1:-}" == "--run" ]]; then /usr/bin/open "$INSTALL_PATH" --args --show; fi
+    if [[ "$INSTALL_ACTION" == "--run" ]]; then /usr/bin/open "$INSTALL_PATH" --args --show; fi
 else
     echo "构建与检查通过。安装运行：./scripts/build.sh --run"
 fi

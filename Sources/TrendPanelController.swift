@@ -30,6 +30,10 @@ private struct TrendChartSpec {
 
 /// 组合资源趋势、原生应用排行和按需系统电量历史，不改变底层采样生命周期。
 final class ResourceTrendController: NSViewController {
+    /// 流向区保留固定高度，屏幕不足时只缩减下方历史曲线的绘图区。
+    private static let powerFlowHeight: CGFloat = 252
+    /// 与趋势图已有最小高度一致，压缩后仍保留标题读数、时间轴和功率曲线。
+    private static let minimumPowerChartHeight: CGFloat = 55
     /// 当前资源决定图表组和需要读取的历史列。
     private let section: ResourceSection
     /// 所有资源共享一个有界历史库。
@@ -38,6 +42,8 @@ final class ResourceTrendController: NSViewController {
     private let ranking: NSViewController?
     /// 电源独有的系统电量历史，和功率趋势在同一个详情中上下排列。
     private let batteryHistory: PowerHistoryPanelController?
+    /// 电源独有的固定实时流向区，采样仍由一级弹窗的共享模型管理。
+    private let powerFlow: PowerFlowPanelController?
     /// 自行采集的曲线固定四档，初次及关闭一级弹窗后统一恢复十分钟。
     private var range: TrendRange = .defaultRange
     /// 不同来源的真实曲线点，隐藏时释放，不缓存二十四小时的所有资源。
@@ -58,13 +64,22 @@ final class ResourceTrendController: NSViewController {
     private var charts: [TrendChartView] = []
     /// 图表组只包含当前资源的实时趋势，不承载系统电量历史。
     private let chartStack = NSStackView()
+    /// 电源三块内容直接纵向排列，非电源资源继续使用原有趋势和排行布局。
+    private let contentStack = NSStackView()
+    /// 功率绘图区高度仅由可用屏幕高度调整，不随实时读数变化。
+    private var powerChartHeightConstraint: NSLayoutConstraint?
+    /// 系统电量历史的完整高度，包含可压缩曲线和不可压缩的标题及摘要。
+    private var batteryHistoryHeightConstraint: NSLayoutConstraint?
     /// 仅在较早历史不可读时出现，实时内存曲线仍可展示。
     private let errorLabel = NSTextField(labelWithString: "")
+    /// 电源错误提示行显隐改变内容高度时通知协调器重新定位；实时采样不调用此回调。
+    var onLayoutChange: (() -> Void)?
 
     /// 组合现有控制器，不改变模型的采样可见性或请求管理员权限。
     init(section: ResourceSection, history: TrendHistoryStore, ranking: NSViewController? = nil,
-         batteryHistory: PowerHistoryPanelController? = nil) {
-        self.section = section; self.history = history; self.ranking = ranking; self.batteryHistory = batteryHistory
+         batteryHistory: PowerHistoryPanelController? = nil, powerFlow: PowerFlowPanelController? = nil) {
+        self.section = section; self.history = history; self.ranking = ranking
+        self.batteryHistory = batteryHistory; self.powerFlow = powerFlow
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -89,13 +104,23 @@ final class ResourceTrendController: NSViewController {
     /// 展示图表时只查询该资源对应的固定列。
     private var metrics: [TrendMetric] { specifications.flatMap(\.metrics) }
 
-    /// 常规资源上方显示趋势、下方伸缩排行；电源先展示电量历史，再展示功率趋势。
+    /// 常规资源上方显示趋势、下方伸缩排行；电源的流向图、电量历史和功率趋势完整纵向展开。
     override func loadView() {
         view = NSView(frame: NSRect(x: 0, y: 0, width: 392, height: 460))
-        let root = NSStackView()
+        let root = contentStack
         root.orientation = .vertical; root.alignment = .leading; root.spacing = 8; root.detachesHiddenViews = true
         root.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(root)
+        if let powerFlow {
+            addChild(powerFlow)
+            let separator = NSBox(); separator.boxType = .separator
+            root.addArrangedSubview(powerFlow.view)
+            root.addArrangedSubview(separator)
+            NSLayoutConstraint.activate([
+                powerFlow.view.heightAnchor.constraint(equalToConstant: Self.powerFlowHeight),
+                separator.heightAnchor.constraint(equalToConstant: 1)
+            ])
+        }
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: view.leadingAnchor), root.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             root.topAnchor.constraint(equalTo: view.topAnchor), root.bottomAnchor.constraint(equalTo: view.bottomAnchor)
@@ -114,8 +139,9 @@ final class ResourceTrendController: NSViewController {
             let chart = TrendChartView(specification: spec)
             charts.append(chart); chartStack.addArrangedSubview(chart)
             let preferred = chart.heightAnchor.constraint(equalToConstant: spec.height)
-            preferred.priority = .defaultHigh; preferred.isActive = true
-            chart.heightAnchor.constraint(greaterThanOrEqualToConstant: 55).isActive = true
+            preferred.priority = section == .power ? .required : .defaultHigh; preferred.isActive = true
+            if section == .power { powerChartHeightConstraint = preferred }
+            chart.heightAnchor.constraint(greaterThanOrEqualToConstant: Self.minimumPowerChartHeight).isActive = true
             chart.widthAnchor.constraint(equalTo: chartStack.widthAnchor).isActive = true
             chart.onHoverTime = { [weak self] time in self?.charts.forEach { $0.setHover(time) } }
         }
@@ -123,7 +149,9 @@ final class ResourceTrendController: NSViewController {
         if let batteryHistory {
             addChild(batteryHistory)
             root.addArrangedSubview(batteryHistory.view)
-            batteryHistory.view.heightAnchor.constraint(equalToConstant: 312).isActive = true
+            let height = batteryHistory.setChartHeight(PowerHistoryPanelController.preferredChartHeight)
+            let constraint = batteryHistory.view.heightAnchor.constraint(equalToConstant: height)
+            constraint.isActive = true; batteryHistoryHeightConstraint = constraint
             let separator = NSBox()
             separator.boxType = .separator
             root.addArrangedSubview(separator)
@@ -137,12 +165,48 @@ final class ResourceTrendController: NSViewController {
             ranking.view.setContentHuggingPriority(.defaultLow, for: .vertical)
         }
         // 无排行时使用底部弹性空间，避免窗口拉高时把图表强行拉伸。
-        if ranking == nil {
+        if ranking == nil && powerFlow == nil {
             let spacer = NSView(); root.addArrangedSubview(spacer)
             spacer.setContentHuggingPriority(.defaultLow, for: .vertical)
         }
         for child in root.arrangedSubviews { child.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true }
         render()
+    }
+
+    /// 呈现电源详情时先恢复两张曲线的正常高度，再按屏幕不足的空间共同压缩绘图区。
+    /// 返回整块内容的实际高度，宿主自行添加四周边距；不创建滚动区域或采样定时器。
+    func fitPowerContent(maximumHeight: CGFloat) -> CGFloat {
+        _ = view
+        guard section == .power, let powerChartHeightConstraint else { return view.fittingSize.height }
+        let preferredPowerHeight = specifications[0].height
+        let preferredBatteryHeight = PowerHistoryPanelController.preferredChartHeight
+        powerChartHeightConstraint.constant = preferredPowerHeight
+        batteryHistoryHeightConstraint?.constant = batteryHistory?.setChartHeight(preferredBatteryHeight) ?? 0
+        let naturalHeight = powerContentHeight
+        let powerReduction = preferredPowerHeight - Self.minimumPowerChartHeight
+        let batteryReduction = batteryHistory == nil ? 0
+            : preferredBatteryHeight - PowerHistoryPanelController.minimumChartHeight
+        let reducibleHeight = powerReduction + batteryReduction
+        let reduction = min(reducibleHeight, max(0, naturalHeight - maximumHeight))
+        guard reduction > 0, reducibleHeight > 0 else { return naturalHeight }
+        let fraction = reduction / reducibleHeight
+        powerChartHeightConstraint.constant = preferredPowerHeight - powerReduction * fraction
+        batteryHistoryHeightConstraint?.constant = batteryHistory?.setChartHeight(
+            preferredBatteryHeight - batteryReduction * fraction) ?? 0
+        return powerContentHeight
+    }
+
+    /// 按独立行的实际字体尺寸和当前曲线高度求和，排除隐藏提示行及其间距。
+    /// 不测量受旧窗口高度约束的根视图，避免从较矮屏幕返回较高屏幕时继续保留压缩尺寸。
+    private var powerContentHeight: CGFloat {
+        let rows = contentStack.arrangedSubviews.filter { !$0.isHidden }
+        let height = rows.reduce(CGFloat.zero) { total, row in
+            if row === powerFlow?.view { return total + Self.powerFlowHeight }
+            if row === batteryHistory?.view { return total + (batteryHistoryHeightConstraint?.constant ?? 0) }
+            if row === chartStack { return total + (powerChartHeightConstraint?.constant ?? 0) }
+            return total + row.fittingSize.height
+        }
+        return height + contentStack.spacing * CGFloat(max(0, rows.count - 1))
     }
 
     /// 仅当前详情订阅实时曲线；电源可见时同步启动按需系统电量历史读取。
@@ -151,13 +215,21 @@ final class ResourceTrendController: NSViewController {
         history.observe(metrics: value ? metrics : [])
         if value {
             _ = view
+            powerFlow?.setVisible(true)
             batteryHistory?.setVisible(true)
             reload()
         } else {
+            powerFlow?.setVisible(false)
             batteryHistory?.setVisible(false)
             series.removeAll(); watermark = 0
             if isViewLoaded { charts.forEach { $0.update(series: [:], range: range, end: end, loading: false) } }
         }
+    }
+
+    /// 实时电源通知只刷新顶部流向区；不查询历史、不重绘下方电量曲线或其他资源。
+    func refreshPowerFlow() {
+        guard visible else { return }
+        powerFlow?.refresh()
     }
 
     /// 关闭一级弹窗后将当前资源趋势恢复十分钟，并重置系统电量历史自身的默认范围。
@@ -208,14 +280,22 @@ final class ResourceTrendController: NSViewController {
     private func reload() {
         guard visible else { return }
         let current = UUID(); epoch = current; loading = true
-        series.removeAll(); end = Date().timeIntervalSince1970; errorLabel.isHidden = true; render()
+        series.removeAll(); end = Date().timeIntervalSince1970; updateHistoryError(nil); render()
         history.load(metrics: metrics, range: range) { [weak self] snapshot in
             guard let self, self.visible, self.epoch == current else { return }
             self.loading = false; self.series = snapshot.series; self.watermark = snapshot.watermark
             self.end = Date().timeIntervalSince1970
-            self.errorLabel.stringValue = snapshot.error ?? ""; self.errorLabel.isHidden = snapshot.error == nil
+            self.updateHistoryError(snapshot.error)
             self.render()
         }
+    }
+
+    /// 历史错误行只有显隐变化时才影响弹窗高度；相同状态不会重复计算窗口尺寸。
+    private func updateHistoryError(_ message: String?) {
+        let hidden = message == nil
+        let visibilityChanged = errorLabel.isHidden != hidden
+        errorLabel.stringValue = message ?? ""; errorLabel.isHidden = hidden
+        if visibilityChanged, visible, section == .power { onLayoutChange?() }
     }
 
     /// 只更新可见图形，没有动画或隐藏页面刷新计时器。
