@@ -15,7 +15,8 @@ private struct PowerFlowValues: Equatable {
     let adapterLoss: Double?
     /// 实际可读部件及估算余量，缺失部件没有字典条目。
     let parts: [PowerComponent: Double]
-    /// 按未舍入功率降序排列的最多六个独立部件，其他固定在最后；未知值仅在有空位时显示。
+    /// CPU、GPU、屏幕固定在前三行，其余按未舍入功率降序补足六项，其他固定在最后。
+    /// 固定部件缺失读数时仍保留位置并显示未知，其余未知值仅在有空位时显示。
     let orderedComponents: [PowerComponent]
     /// 说明首次采集、缺失字段或不同采样口径，不向用户暴露私有接口实现。
     let note: String
@@ -31,13 +32,17 @@ private struct PowerFlowValues: Equatable {
         let measured = (components?.watts ?? [:]).filter { $0.key != .other }
         let expected = Set(PowerComponent.coreComponents).union(components?.availableComponents ?? []).union(measured.keys)
         let candidates = PowerComponent.allCases.filter { $0 != .other && expected.contains($0) }
-        let sorted = candidates.sorted {
+        // 三个核心部件始终保留相同位置，避免功率变化或暂时无读数时行顺序跳动。
+        let fixedComponents: [PowerComponent] = [.cpu, .gpu, .display]
+        let sorted = candidates.filter { !fixedComponents.contains($0) }.sorted {
             let left = measured[$0] ?? -1, right = measured[$1] ?? -1
             if left != right { return left > right }
             return (PowerComponent.allCases.firstIndex(of: $0) ?? 0) < (PowerComponent.allCases.firstIndex(of: $1) ?? 0)
         }
-        let selected = Array(sorted.prefix(6))
-        let folded = sorted.dropFirst(6)
+        // 六项总数包含三个固定部件；剩余名额按真实功率选取，未展开项继续合并到其他。
+        let remainingSlots = 6 - fixedComponents.count
+        let selected = fixedComponents + Array(sorted.prefix(remainingSlots))
+        let folded = sorted.dropFirst(remainingSlots)
         let unknown = candidates.filter { measured[$0] == nil }
         let foldedWatts = folded.reduce(0) { $0 + (measured[$1] ?? 0) }
         var displayed = measured.filter { selected.contains($0.key) }
@@ -57,7 +62,7 @@ private struct PowerFlowValues: Equatable {
         } else if !unknown.isEmpty {
             note = "\(unknown.map(\.title).joined(separator: "、"))未知，其他含未测量负载"
         } else {
-            note = "前六项按功率排序，其余合并到其他"
+            note = "CPU、GPU、屏幕固定在前，其余按功率排序"
         }
         var explanations = [note, "部件功耗来自系统模型估算，屏幕仅表示内置背光；其他包含差值估算和未展开部件。"]
         if power.estimated { explanations.append("整机与电池功率由电压电流或收支推算。") }
