@@ -7,7 +7,7 @@ enum CPUServiceIdentity {
     /// 已安装工具的唯一位置，由系统的特权工具安装服务管理。
     static let installedPath = "/Library/PrivilegedHelperTools/" + label
     /// 只接受本机既有固定签名，不使用任意同名程序。
-    static let certificate = "659A2CD838DF7ADCB88F313BDE6572A223C4923C"
+    static let certificate = BuildSigningIdentity.certificate
     /// 辅助服务只允许本工具请求只读统计。
     static let clientRequirement = "identifier \"com.local.NetworkSpeedMonitor\" and certificate root = H\"\(certificate)\""
     /// 主程序同样校验服务身份，拒绝其他程序伪装成采集器。

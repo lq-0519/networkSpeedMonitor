@@ -1,14 +1,23 @@
 #!/bin/bash
 set -euo pipefail
 
-# 固定已存在的本机证书指纹；证书缺失时停止，保持所有升级的授权身份一致。
-SIGNING_IDENTITY="659A2CD838DF7ADCB88F313BDE6572A223C4923C"
 # 主程序、登录项和偏好使用同一个不可变 Bundle ID。
 BUNDLE_ID="com.local.NetworkSpeedMonitor"
 # 安装路径是应用长期运行的位置，不从临时构建目录启动。
 INSTALL_PATH="/Applications/NetworkSpeedMonitor.app"
 # 从脚本位置定位项目，允许在任意工作目录执行。
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# 每台 Mac 使用本机稳定证书；原始指纹仍是未配置时的默认值。
+DEFAULT_SIGNING_IDENTITY="659A2CD838DF7ADCB88F313BDE6572A223C4923C"
+if [[ -z "${SIGNING_IDENTITY:-}" && -f "$PROJECT_DIR/.signing-identity.local" ]]; then
+    SIGNING_IDENTITY="$(cat "$PROJECT_DIR/.signing-identity.local")"
+fi
+SIGNING_IDENTITY="${SIGNING_IDENTITY:-$DEFAULT_SIGNING_IDENTITY}"
+if [[ ! "$SIGNING_IDENTITY" =~ ^[0-9A-Fa-f]{40}$ ]]; then
+    echo "签名身份必须是代码签名证书的 40 位 SHA-1 指纹。" >&2
+    exit 1
+fi
+SIGNING_IDENTITY="$(printf '%s' "$SIGNING_IDENTITY" | tr '[:lower:]' '[:upper:]')"
 # 中间产物全部在仓库外，退出时自动清理。
 BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/network-speed-build.XXXXXX")"
 trap 'rm -rf "$BUILD_DIR"' EXIT
@@ -26,7 +35,7 @@ for argument in "$@"; do
 done
 
 if ! /usr/bin/security find-identity -v -p codesigning | /usr/bin/grep -Fq "$SIGNING_IDENTITY"; then
-    echo "缺少固定签名证书 InputHoldSwitcher Local Code Signing。" >&2
+    echo "缺少配置的代码签名证书：$SIGNING_IDENTITY" >&2
     exit 1
 fi
 if [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PROJECT_DIR/Info.plist")" != "$BUNDLE_ID" ]]; then
@@ -38,6 +47,18 @@ fi
 APP_DIR="$BUILD_DIR/NetworkSpeedMonitor.app"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources" "$APP_DIR/Contents/Library/LaunchServices" "$BUILD_DIR/modules"
 cp "$PROJECT_DIR/Info.plist" "$APP_DIR/Contents/Info.plist"
+cp "$PROJECT_DIR/Helper/Info.plist" "$BUILD_DIR/Helper-Info.plist"
+# 构建时将同一证书写入主程序、辅助服务和双向 XPC 校验；不修改仓库模板。
+/usr/libexec/PlistBuddy -c "Set :SMPrivilegedExecutables:com.local.NetworkSpeedMonitor.CPUHelper identifier \\\"com.local.NetworkSpeedMonitor.CPUHelper\\\" and certificate root = H\\\"$SIGNING_IDENTITY\\\"" "$APP_DIR/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :SMAuthorizedClients:0 identifier \\\"$BUNDLE_ID\\\" and certificate root = H\\\"$SIGNING_IDENTITY\\\"" "$BUILD_DIR/Helper-Info.plist"
+expected_helper="identifier \"com.local.NetworkSpeedMonitor.CPUHelper\" and certificate root = H\"$SIGNING_IDENTITY\""
+expected_client="identifier \"$BUNDLE_ID\" and certificate root = H\"$SIGNING_IDENTITY\""
+if [[ "$(/usr/libexec/PlistBuddy -c 'Print :SMPrivilegedExecutables:com.local.NetworkSpeedMonitor.CPUHelper' "$APP_DIR/Contents/Info.plist")" != "$expected_helper" || \
+      "$(/usr/libexec/PlistBuddy -c 'Print :SMAuthorizedClients:0' "$BUILD_DIR/Helper-Info.plist")" != "$expected_client" ]]; then
+    echo "管理员服务签名约束生成错误，停止构建。" >&2
+    exit 1
+fi
+printf 'enum BuildSigningIdentity { static let certificate = "%s" }\n' "$SIGNING_IDENTITY" > "$BUILD_DIR/BuildSigningIdentity.swift"
 cp "$PROJECT_DIR/PrivacyInfo.xcprivacy" "$APP_DIR/Contents/Resources/PrivacyInfo.xcprivacy"
 /usr/bin/xcrun clang -O2 -Wall -Wextra -Werror -mmacosx-version-min=13.0 \
     "$PROJECT_DIR/Sources/NetworkSampler.c" "$PROJECT_DIR/Sources/NativeRoutes.c" \
@@ -45,14 +66,14 @@ cp "$PROJECT_DIR/PrivacyInfo.xcprivacy" "$APP_DIR/Contents/Resources/PrivacyInfo
 /usr/bin/xcrun swiftc -O -swift-version 5 -target "$(uname -m)-apple-macosx13.0" \
     -module-cache-path "$BUILD_DIR/modules" \
     -framework Foundation \
-    -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker "$PROJECT_DIR/Helper/Info.plist" \
+    -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker "$BUILD_DIR/Helper-Info.plist" \
     -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __launchd_plist -Xlinker "$PROJECT_DIR/Helper/Launchd.plist" \
-    "$PROJECT_DIR"/Shared/*.swift "$PROJECT_DIR/Helper/main.swift" \
+    "$PROJECT_DIR"/Shared/*.swift "$BUILD_DIR/BuildSigningIdentity.swift" "$PROJECT_DIR/Helper/main.swift" \
     -o "$APP_DIR/Contents/Library/LaunchServices/com.local.NetworkSpeedMonitor.CPUHelper"
 /usr/bin/xcrun swiftc -O -swift-version 5 -target "$(uname -m)-apple-macosx13.0" \
     -module-cache-path "$BUILD_DIR/modules" \
     -framework AppKit -framework Network -framework SystemConfiguration -framework ServiceManagement -framework Security -framework IOKit -lsqlite3 -lz \
-    "$PROJECT_DIR"/Shared/*.swift "$PROJECT_DIR"/Sources/*.swift -o "$APP_DIR/Contents/MacOS/NetworkSpeedMonitor"
+    "$PROJECT_DIR"/Shared/*.swift "$BUILD_DIR/BuildSigningIdentity.swift" "$PROJECT_DIR"/Sources/*.swift -o "$APP_DIR/Contents/MacOS/NetworkSpeedMonitor"
 /usr/bin/codesign --force --timestamp=none --identifier com.local.NetworkSpeedMonitor.CPUHelper \
     --sign "$SIGNING_IDENTITY" "$APP_DIR/Contents/Library/LaunchServices/com.local.NetworkSpeedMonitor.CPUHelper"
 /usr/bin/codesign --force --timestamp=none --sign "$SIGNING_IDENTITY" "$APP_DIR/Contents/MacOS/NetworkSampler"
@@ -64,10 +85,10 @@ if [[ "$RUN_SELF_CHECK" == true ]]; then
 fi
 
 if [[ "$INSTALL_ACTION" == "--install" || "$INSTALL_ACTION" == "--run" ]]; then
-    # 更新前校验已有安装身份，防止意外覆盖同名的其他软件。
+    # 只允许配置身份或原有默认身份的安装，避免覆盖同名应用。
     if [[ -e "$INSTALL_PATH" ]]; then
         /usr/bin/codesign --verify --deep --strict \
-            -R "=identifier \"$BUNDLE_ID\" and certificate root = H\"$SIGNING_IDENTITY\"" "$INSTALL_PATH"
+            -R "=identifier \"$BUNDLE_ID\" and (certificate root = H\"$SIGNING_IDENTITY\" or certificate root = H\"$DEFAULT_SIGNING_IDENTITY\")" "$INSTALL_PATH"
     fi
     # 使用临时同卷目录准备完整安装包，构建或校验失败时不会破坏现有版本。
     STAGE_DIR="$(mktemp -d /Applications/.network-speed-stage.XXXXXX)"

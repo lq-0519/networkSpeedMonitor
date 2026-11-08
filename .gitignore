@@ -21,3 +21,6 @@
 *.p12
 *.pfx
 *.key
+
+# Per-machine signing identity (certificate SHA-1 or name)
+/.signing-identity.local

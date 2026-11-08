@@ -260,10 +260,18 @@ final class PowerComponentReader {
                                availableComponents: availableComponents.union(watts.keys))
     }
 
+    /// 新款和较早机型使用不同背光键；不把缺失或异常值当作零。
+    static func displayPower(read: (String) -> Double?) -> Double? {
+        for key in ["PBwo", "PDBR"] {
+            if let value = read(key), value.isFinite, value >= 0, value < 200 { return value }
+        }
+        return nil
+    }
+
     /// 同轮读取背光及能耗模型，真实间隔超出三十秒时重建基线；没有字段的部件保持未知。
     func sample(smc: SMCReadConnection?, external: Bool?) -> PowerComponentSnapshot {
         var watts: [PowerComponent: Double] = [:]
-        if let display = smc?.readNumber("PDBR"), display.isFinite, display >= 0, display < 200 {
+        if let display = Self.displayPower(read: { smc?.readNumber($0) }) {
             watts[.display] = display
         }
         if previousExternal != external { previous = nil }

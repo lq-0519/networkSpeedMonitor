@@ -487,6 +487,12 @@ enum Diagnostics {
               "Intel 风扇定点编码按大端四分之一 RPM 解码")
         check(SMCNumericDecoder.decode(type: "ui8 ", bytes: [2]) == 2,
               "SMC 风扇数量使用无符号单字节")
+        check(PowerComponentReader.displayPower { $0 == "PBwo" ? 2.5 : 1.5 } == 2.5,
+              "新版背光传感器优先用于 M5 Pro 等支持机型")
+        check(PowerComponentReader.displayPower { $0 == "PBwo" ? .nan : 1.5 } == 1.5,
+              "新版背光读数无效时回退到旧传感器")
+        check(PowerComponentReader.displayPower { _ in nil } == nil,
+              "背光传感器缺失时保留未知")
         check(FanReader.validRPM(0) == 0 && FanReader.validRPM(8_000) == 8_000,
               "停止状态和合理转速均可保留")
         check(FanReader.validRPM(.nan) == nil && FanReader.validRPM(30_001) == nil,
