@@ -65,7 +65,7 @@ final class NettopCollector {
         queue.async { [weak self] in self?.request = nil; self?.stopLocked() }
     }
 
-    /// 应用退出时同步收回管道和子进程，避免菜单栏退出后留下孤立的采集任务。
+    /// 应用退出时同步关闭保活管道；包装器收到 EOF 后收回 nettop，不阻塞主线程等待进程通知。
     func shutdown() {
         allowedDelivery = UUID()
         queue.sync { request = nil; stopLocked() }
@@ -171,21 +171,20 @@ final class NettopCollector {
         }
     }
 
-    /// 同步取消旧回调，并以 SIGTERM 结束本程序创建的子进程，不影响任何其他 nettop。
+    /// 同步取消旧回调并关闭保活管道，让包装器通过 stdin EOF 结束它亲自创建的 nettop。
+    /// 不调用 Process.waitUntilExit：系统进程已退出而 Foundation 的退出通知尚未交付时，
+    /// 该调用可能永久占住串行队列，使后续重启、超时恢复和应用退出都无法继续。
+    /// EOF 不会像信号一样在包装器注册事件前丢失；包装器最多等待 nettop 0.5 秒后强制收回。
     private func stopLocked() {
         generation += 1
         flush?.cancel(); watchdog?.cancel(); retry?.cancel()
         flush = nil; watchdog = nil; retry = nil
         outputPipe?.fileHandleForReading.readabilityHandler = nil
         process?.terminationHandler = nil
-        if let child = process, child.isRunning {
-            child.terminate()
-            // 包装器在 0.5 秒内结束它持有的 nettop，再退出；等待避免更新时遗留采集进程。
-            child.waitUntilExit()
-        }
-        try? outputPipe?.fileHandleForReading.close()
+        // 先关闭唯一保活写端；不依赖 Process 缓存的 isRunning 状态或退出回调推进下一轮采集。
         try? inputPipe?.fileHandleForWriting.close()
         try? inputPipe?.fileHandleForReading.close()
+        try? outputPipe?.fileHandleForReading.close()
         process = nil; outputPipe = nil; inputPipe = nil
     }
 }
