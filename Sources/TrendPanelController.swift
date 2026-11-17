@@ -10,10 +10,16 @@ private enum TrendAxis {
     case fan
     /// 多项功率共用瓦特坐标；电池放电可低于零，输入与系统耗电保持正值。
     case signed
-    /// 已用容量紧贴窗口真实最小最大值，不强制从零开始。
+    /// 已用容量按窗口真实极值缩放，纵轴至少跨 512 MB，不足时上下居中补足。
     case capacity
-    /// 下载位于中线上方，上传位于下方，上下共用速度尺度。
+    /// 磁盘读取位于中线上方，写入位于下方，上下共用速度尺度。
     case mirrored
+    /// 下载位于中线上方、上传位于下方，各自按可见窗口内的真实峰值缩放。
+    /// 两个方向各占一半绘图区，中线始终为零；零流量时不人为抬高对应峰值。
+    case independentMirrored
+
+    /// 双向速度轴都以中线为零，并将上传或写入画在下方；上下是否共用尺度由具体轴决定。
+    var isMirrored: Bool { self == .mirrored || self == .independentMirrored }
 }
 
 /// 原生曲线的静态展示规格，不持有采样器或定时器。
@@ -91,7 +97,7 @@ final class ResourceTrendController: NSViewController {
         switch section {
         case .cpu: return [TrendChartSpec(title: "CPU 占用", metrics: [.cpu], axis: .percent, height: 150)]
         case .memory: return [TrendChartSpec(title: "已用内存", metrics: [.memory], axis: .memory, height: 150)]
-        case .network: return [TrendChartSpec(title: "网络速度", metrics: [.download, .upload], axis: .mirrored, height: 170)]
+        case .network: return [TrendChartSpec(title: "网络速度", metrics: [.download, .upload], axis: .independentMirrored, height: 170)]
         case .disk: return [TrendChartSpec(title: "磁盘已用容量", metrics: [.diskUsed], axis: .capacity, height: 125),
                             TrendChartSpec(title: "磁盘读写", metrics: [.diskRead, .diskWrite], axis: .mirrored, height: 170)]
         case .power: return [TrendChartSpec(title: "功率对比",
@@ -262,7 +268,7 @@ final class ResourceTrendController: NSViewController {
         }
         for metric in metrics {
             let points = (series[metric] ?? []).filter { $0.time >= start && $0.time <= end }
-            // 容量与风扇保留完整标量，以便滑动窗口的上下限始终来自窗口内真实最小最大值。
+            // 网络、容量与风扇保留完整标量，以便旧极值滑出窗口后仍能准确计算新的上下限。
             series[metric] = metric.usesWindowBounds || points.count <= 800
                 ? points : TrendDownsampler.reduce(points, since: start, range: range)
         }
@@ -307,13 +313,16 @@ final class ResourceTrendController: NSViewController {
 
 /// 几百个显示点的 AppKit 曲线；无 WebView、持续动画或额外渲染循环。
 private final class TrendChartView: NSView {
+    /// 磁盘已用容量纵轴至少展示 512 MB，沿用容量标签的十进制单位，即 512,000,000 字节。
+    /// 四档时间窗口共用此下限，避免短时间内的微小变化被放大到整个绘图区。
+    private static let minimumCapacitySpan: Double = 512_000_000
     /// 同组功率或磁盘图共享悬停时间，便于比较同一时刻。
     var onHoverTime: ((TimeInterval?) -> Void)?
     /// 固定的指标、纵轴和标题配置。
     private let specification: TrendChartSpec
-    /// 可见曲线的真实显示点；容量与风扇纵轴另从完整标量计算。
+    /// 可见曲线的真实显示点；网络、容量与风扇纵轴另从完整标量计算。
     private var series: [TrendMetric: [TrendPoint]] = [:]
-    /// 当前图形纵轴最小最大值，不随鼠标移动重新计算。
+    /// 当前图形纵轴最小最大值，不随鼠标移动重新计算；独立网络轴分别保存负上传峰值与正下载峰值。
     private var limits: (low: Double, high: Double) = (0, 1)
     /// 固定四档窗口，初始范围与资源控制器统一默认十分钟。
     private var range: TrendRange = .defaultRange
@@ -349,9 +358,13 @@ private final class TrendChartView: NSView {
         self.range = range; self.end = end; self.loading = loading
         let start = end - Double(range.rawValue)
         var values: [Double] = []
+        // 在绘图压缩前分别求每条曲线的峰值，网络两个方向不能被另一个方向的流量抬高刻度。
+        var peaks: [TrendMetric: Double] = [:]
         for metric in specification.metrics {
             let points = (source[metric] ?? []).filter { $0.time >= start && $0.time <= end }
-            values += points.compactMap(\.value)
+            let metricValues = points.compactMap(\.value)
+            values += metricValues
+            peaks[metric] = metricValues.max()
             series[metric] = points.count <= 800 ? points : TrendDownsampler.reduce(points, since: start, range: range)
         }
         let minimum = values.min() ?? 0, maximum = values.max() ?? 0
@@ -359,11 +372,17 @@ private final class TrendChartView: NSView {
         case .percent: limits = (0, 100)
         case .memory: limits = (0, Double(ProcessInfo.processInfo.physicalMemory))
         case .mirrored: let peak = max(1024, maximum); limits = (-peak, peak)
+        case .independentMirrored:
+            limits = (-max(0, peaks[.upload] ?? 0), max(0, peaks[.download] ?? 0))
         case .signed: limits = (min(0, minimum), max(1, maximum))
-        case .capacity, .fan:
-            // 非恒定数据严格使用窗口极值；恒定数据才按容量字节或转速单位扩展，避免零跨度。
-            let padding = specification.axis == .capacity
-                ? max(50_000_000, abs(minimum) * 0.00001) : max(1, abs(minimum) * 0.001)
+        case .capacity:
+            // 不足最小跨度时向真实极值两侧均匀补足；接近零时整体上移，确保下界非负且跨度不缩小。
+            let span = max(Self.minimumCapacitySpan, maximum - minimum)
+            let low = max(0, minimum - (span - (maximum - minimum)) / 2)
+            limits = (low, low + span)
+        case .fan:
+            // 非恒定转速严格使用窗口极值，恒定转速才扩展范围以避免零跨度。
+            let padding = max(1, abs(minimum) * 0.001)
             limits = maximum > minimum ? (minimum, maximum) : (max(0, minimum - padding), maximum + padding)
         }
         setAccessibilityValue(specification.metrics.compactMap { metric in
@@ -431,11 +450,19 @@ private final class TrendChartView: NSView {
         let axisMetric = specification.metrics.first ?? .cpu
         for fraction in [0.0, 0.5, 1.0] {
             let y = plot.minY + CGFloat(fraction) * plot.height
-            let value = limits.low + fraction * (limits.high - limits.low)
-            NSColor.separatorColor.withAlphaComponent(fraction == 0.5 && specification.axis == .mirrored ? 0.9 : 0.45).setStroke()
+            let value: Double
+            if specification.axis == .independentMirrored {
+                // 网络刻度在上下端分别显示上传、下载峰值，中间固定为零，不能对不对称上下限做线性插值。
+                value = fraction == 0.5 ? 0 : (fraction == 0 ? limits.low : limits.high)
+            } else {
+                value = limits.low + fraction * (limits.high - limits.low)
+            }
+            let metric: TrendMetric = specification.axis == .independentMirrored && fraction == 0 ? .upload : axisMetric
+            NSColor.separatorColor.withAlphaComponent(fraction == 0.5 && specification.axis.isMirrored ? 0.9 : 0.45).setStroke()
             let line = NSBezierPath(); line.move(to: NSPoint(x: plot.minX, y: y)); line.line(to: NSPoint(x: plot.maxX, y: y))
             line.lineWidth = 0.5; line.stroke()
-            drawText(format(abs(value), metric: axisMetric, signed: specification.axis == .signed && value < 0),
+            let missingPeak = specification.axis == .independentMirrored && fraction != 0.5 && !active.contains(metric)
+            drawText(missingPeak ? "—" : format(abs(value), metric: metric, signed: specification.axis == .signed && value < 0),
                      rect: NSRect(x: 0, y: y - 6, width: plot.minX - 6, height: 12),
                      color: .labelColor, weight: .medium, alignment: .right)
         }
@@ -464,9 +491,7 @@ private final class TrendChartView: NSView {
                 if let previous, previous.value != nil, previous.segment == point.segment, !point.breakBefore {
                     let before = coordinate(previous, metric: metric)
                     let zero = y(max(limits.low, min(limits.high, 0)))
-                    let shouldFill: Bool
-                    if case .mirrored = specification.axis { shouldFill = true }
-                    else { shouldFill = specification.metrics.count == 1 }
+                    let shouldFill = specification.axis.isMirrored || specification.metrics.count == 1
                     if shouldFill {
                         let fill = NSBezierPath(); fill.move(to: NSPoint(x: before.x, y: zero)); fill.line(to: before)
                         fill.line(to: location); fill.line(to: NSPoint(x: location.x, y: zero)); fill.close()
@@ -491,15 +516,21 @@ private final class TrendChartView: NSView {
         }
     }
 
-    /// 将真实数值映射到纵轴；容量面积填充也会被裁剪在窗口最小最大值之间。
+    /// 将真实数值映射到纵轴；网络上下方向各用自己的峰值映射到半幅高度，零值始终落在中线。
+    /// 某方向全为零或缺失时直接回到中线，避免除零；其他资源仍沿用整幅线性映射及容量裁剪。
     private func y(_ value: Double) -> CGFloat {
-        plot.minY + CGFloat((value - limits.low) / max(0.000001, limits.high - limits.low)) * plot.height
+        if specification.axis == .independentMirrored {
+            let peak = value >= 0 ? limits.high : -limits.low
+            let fraction = peak > 0 ? value / peak : 0
+            return plot.midY + CGFloat(fraction) * plot.height / 2
+        }
+        return plot.minY + CGFloat((value - limits.low) / max(0.000001, limits.high - limits.low)) * plot.height
     }
 
     /// 上传和磁盘写入仅改变视觉方向，实际读数和历史值始终为正速度。
     private func coordinate(_ point: TrendPoint, metric: TrendMetric) -> NSPoint {
         let mirroredBelow = metric == .upload || metric == .diskWrite
-        let value = (point.value ?? 0) * (specification.axis == .mirrored && mirroredBelow ? -1 : 1)
+        let value = (point.value ?? 0) * (specification.axis.isMirrored && mirroredBelow ? -1 : 1)
         return NSPoint(x: plot.minX + CGFloat((point.time - end + Double(range.rawValue)) / Double(range.rawValue)) * plot.width, y: y(value))
     }
 

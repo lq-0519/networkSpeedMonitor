@@ -48,9 +48,9 @@ enum TrendMetric: Int, CaseIterable {
     /// 位图区分本轮未采集与已采集但无效的 NULL，后者必须使曲线断开。
     var mask: Int64 { Int64(1) << rawValue }
 
-    /// 已用容量与风扇转速按可见窗口的真实极值确定纵轴，因此查询及实时缓存保留完整标量。
+    /// 上传、下载、已用容量与风扇转速按可见窗口的真实极值确定纵轴，因此查询及实时缓存保留完整标量。
     /// 绘图仍可压缩；旧极值滑出窗口后，未被压缩丢弃的其余样本可准确给出新的上下限。
-    var usesWindowBounds: Bool { self == .diskUsed || rawValue >= Self.fan0.rawValue }
+    var usesWindowBounds: Bool { self == .download || self == .upload || self == .diskUsed || rawValue >= Self.fan0.rawValue }
 
     /// 将合法 SMC 编号映射到固定列，不为异常数量创建无限列或缓存。
     static func fan(_ index: Int) -> TrendMetric? {
