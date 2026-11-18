@@ -21,11 +21,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private lazy var trendSampler = TrendSampler(history: history)
     /// 常见速度使用紧凑固定宽度，仅在超长数值时扩展以避免裁切。
     private var statusItem: NSStatusItem?
+    /// 仅在启动或设置变化时读取显示偏好；高频回调直接使用此缓存，避免每轮重复访问 UserDefaults。
+    private var statusComponents = Set(MenuBarComponent.allCases)
     /// 接收按钮外观变化；系统生成菜单栏快照时也会临时改变外观，因此通知不直接使绘制缓存失效。
     private var statusAppearanceObservation: NSKeyValueObservation?
     /// 同一轮主队列只安排一次外观刷新，待系统恢复快照的临时外观后，再由内容与最终外观共同去重。
     private var statusAppearanceRefreshPending = false
-    /// 合并短时间内的 CPU、网速、电池通知；一次性任务只延后绘图，不改变采样或历史记录时刻。
+    /// 合并短时间内的 CPU、内存、网速、电池通知；一次性任务只延后绘图，不改变采样或历史记录时刻。
     private var statusRefreshWork: DispatchWorkItem?
     /// 辅助功能名称只随组件选择变化；外观快照和数值更新不重复提交相同名称。
     private var statusAccessibilityLabel: String?
@@ -59,6 +61,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             NSApp.terminate(nil)
             return
         }
+        MenuBarPreferences.migrateMemoryComponentIfNeeded()
         NSApp.setActivationPolicy(.accessory)
         signal(SIGTERM, SIG_IGN)
         let termination = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
@@ -103,7 +106,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             self?.trendSampler.receivePower(snapshot, fans: fans, at: time, interval: interval)
         }
         trendSampler.onSystemUpdate = { [weak self] usage, capacity in
-            self?.memory.receiveSystem(usage); self?.disk.receiveSystem(capacity)
+            guard let self else { return }
+            let previous = self.memory.systemUsage
+            self.memory.receiveSystem(usage); self.disk.receiveSystem(capacity)
+            // 只复用趋势已有的内存读数；图形取整值或压力变化才参与原有合并刷新，不增加采集和周期任务。
+            if self.statusComponents.contains(.memory),
+               previous?.menuBarPercent != usage?.menuBarPercent || previous?.pressure != usage?.pressure {
+                self.requestStatusItemRefresh()
+            }
         }
         history.onAppend = { [weak self] sample in
             guard let self, self.popover.isShown else { return }
@@ -322,8 +332,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// 显示偏好只更新菜单栏与轻量电池观察，不重启网络、CPU 或任何弹窗采样。
     private func applyMenuBarPreferences() {
+        statusComponents = MenuBarPreferences.components
         statusNetworkWidth = 0
-        battery.setEnabled(MenuBarPreferences.components.contains(.battery))
+        battery.setEnabled(statusComponents.contains(.battery))
         refreshStatusItem()
     }
 
@@ -343,16 +354,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func refreshStatusItem() {
         statusRefreshWork?.cancel(); statusRefreshWork = nil
         guard let button = statusItem?.button else { return }
-        let components = MenuBarPreferences.components
+        let components = statusComponents
         let down = monitor.download.map(SpeedText.string) ?? "—"
         let up = monitor.upload.map(SpeedText.string) ?? "—"
         let cpuValue = cpu.usage.flatMap { $0.total.isFinite ? min(100, max(0, $0.total)) : nil }
         let percent = cpuValue.map { Int($0.rounded()) }
         let cpuText = percent.map(String.init) ?? "—"
+        let memoryUsage = components.contains(.memory) ? memory.systemUsage : nil
+        let memoryValue = memoryUsage?.menuBarPercent
         let batteryStatus = battery.snapshot
         let selection = MenuBarComponent.allCases.filter(components.contains)
         let title = [selection.map(\.rawValue).joined(separator: ","), button.effectiveAppearance.name.rawValue,
                      components.contains(.cpu) ? cpuValue.map { String(format: "%.2f", $0) } ?? "—" : "",
+                     components.contains(.memory) ? memoryValue.map(String.init) ?? "—" : "",
                      components.contains(.network) ? "\(down)|\(up)" : "",
                      components.contains(.battery) ? "\(batteryStatus?.percentageText ?? "—")|\(batteryStatus?.secondaryText ?? "—")|\(batteryStatus?.showsLightning == true)" : ""]
             .joined(separator: "|")
@@ -362,7 +376,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             var image: NSImage?
             button.effectiveAppearance.performAsCurrentDrawingAppearance {
-                image = StatusItemImage.make(download: down, upload: up, cpuPercent: cpuValue,
+                image = StatusItemImage.make(download: down, upload: up, cpuPercent: cpuValue, memoryPercent: memoryValue,
                                              components: components, battery: batteryStatus, minimumNetworkWidth: statusNetworkWidth)
             }
             if let image {
@@ -381,6 +395,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             details.append("下载 \(down) · 上传 \(up)\(directDetail)\n\(monitor.sourceDescription) · \(monitor.status)")
         }
         if components.contains(.cpu) { details.append("整机 CPU：\(cpuText)% · \(cpu.interval) 秒刷新") }
+        if components.contains(.memory) {
+            if let usage = memoryUsage, let memoryValue {
+                details.append("内存：\(memoryValue)% · 已用 \(MemoryText.string(usage.usedBytes)) / 总量 \(MemoryText.string(usage.totalBytes)) · 压力 \(usage.pressure.title)")
+            } else {
+                details.append("内存数据不可用")
+            }
+        }
         if components.contains(.battery) { details.append(batteryStatus?.detailText ?? "电池数据不可用") }
         let detail = details.joined(separator: "\n")
         if button.toolTip != detail {

@@ -21,7 +21,7 @@ enum Diagnostics {
               "正常解锁会话允许采样")
         check(AppDelegate.initialPauseReasons(session: nil).isEmpty, "未知启动会话仍由生命周期通知控制")
         // 显示偏好不写入真实设置；覆盖升级默认、未知键过滤和连续颜色的完整取值范围。
-        check(MenuBarPreferences.validated(nil) == Set(MenuBarComponent.allCases), "首次启动默认显示 CPU、网络与电池")
+        check(MenuBarPreferences.validated(nil) == Set(MenuBarComponent.allCases), "首次启动默认显示 CPU、内存、网络与电池")
         check(MenuBarPreferences.validated([]) == Set(MenuBarComponent.allCases), "空配置不能隐藏整个菜单栏入口")
         check(MenuBarPreferences.validated(["future", "battery"]) == [.battery], "忽略未知选项并保留有效电池选择")
         /// 在统一 sRGB 空间比较最大通道差值，避免用动态 NSColor 对象身份判断视觉颜色。
@@ -87,10 +87,10 @@ enum Diagnostics {
                                                   components: [.cpu, .network], battery: nil)
         check(originalStatus.size.height == 22 && !originalStatus.isTemplate,
               "CPU 和固定宽度网速保持 22pt 高度，并合为一张原生彩色按钮图像")
-        let batteryStatus = StatusItemImage.make(download: "276 KB/s", upload: "36 KB/s", cpuPercent: 25,
-                                                 components: [.cpu, .network, .battery], battery: remainingBattery)
+        let batteryStatus = StatusItemImage.make(download: "276 KB/s", upload: "36 KB/s", cpuPercent: 25, memoryPercent: 67,
+                                                 components: [.cpu, .memory, .network, .battery], battery: remainingBattery)
         check(!batteryStatus.isTemplate && batteryStatus.size.height == 22,
-              "CPU、电量和文字合为一张原生图像，不再叠加独立彩色视图")
+              "CPU、内存、电量和文字合为一张原生图像，不再叠加独立彩色视图")
         let shortSpeedExamples = ["—", "0 B/s", "999 B/s", "1000 B/s", "14 KB/s", "99 KB/s"]
         let compactStatus = StatusItemImage.make(download: "14 KB/s", upload: "14 KB/s", cpuPercent: 25,
                                                  components: [.cpu, .network, .battery], battery: remainingBattery)

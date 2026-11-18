@@ -32,7 +32,7 @@ enum StatusItemColorScale {
     }
 }
 
-/// 单个菜单栏按钮的组合图像，按 CPU、网速、电池固定顺序拼接勾选的内容。
+/// 单个菜单栏按钮的组合图像，按 CPU、内存、网速、电池固定顺序拼接勾选的内容。
 enum StatusItemImage {
     /// 系统符号只解析一次；最终颜色在每张位图的独立透明层内合成，不保留延迟绘图回调。
     private static let lightningSymbol: NSImage? = {
@@ -67,14 +67,17 @@ enum StatusItemImage {
 
     /// 保留现有尺寸和字号，提前生成普通与 Retina 位图；系统快照只复制像素，不重复执行文字和符号绘制。
     /// minimumNetworkWidth 由主应用保留已使用的最大列宽，缩小缓冲后也不会随数字变短而反复回缩。
-    static func make(download: String, upload: String, cpuPercent: Double?,
+    /// memoryPercent 使用整数百分比控制小饼图与缓存精度；省略时保留旧调用的未知内存状态。
+    static func make(download: String, upload: String, cpuPercent: Double?, memoryPercent: Int? = nil,
                      components: Set<MenuBarComponent>, battery: BatteryStatus?, minimumNetworkWidth: CGFloat = 0) -> NSImage {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium)
         let percentageFont = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .medium)
         let secondaryFont = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
         let cpuColor = components.contains(.cpu) ? StatusItemColorScale.cpu(percent: cpuPercent) : nil
+        let memoryValue = memoryPercent.flatMap { (0...100).contains($0) ? Double($0) : nil }
+        let memoryColor: NSColor? = components.contains(.memory) && memoryValue != nil ? .systemOrange : nil
         let batteryColor = components.contains(.battery) ? StatusItemColorScale.battery(percent: battery?.percent) : nil
-        let isTemplate = cpuColor == nil && batteryColor == nil
+        let isTemplate = cpuColor == nil && memoryColor == nil && batteryColor == nil
         // 有彩色内容时也解析同一个按钮外观下的原生文字色，避免另一层视图独立变亮、偏色或拒绝淡化。
         let foreground = isTemplate ? NSColor.black : NSColor.controlTextColor.usingColorSpace(.sRGB) ?? .controlTextColor
         let lines = ["↑ \(upload)", "↓ \(download)"].map { line($0, font: font, color: foreground) }
@@ -84,6 +87,10 @@ enum StatusItemImage {
         // 保留三分之一的小缓冲；主应用传入已使用的最大宽度，数字回落时不会推动电池来回移动。
         let textAreaWidth = max(compactNetworkWidth, max(minimumNetworkWidth, ceil(textWidth)))
         var width: CGFloat = components.contains(.cpu) ? 14 : 0
+        // 每个饼图连同描边占 14pt，CPU 与内存的可见边缘只留 2pt，单独显示时不保留空位。
+        if components.contains(.memory), width > 0 { width += 2 }
+        let memoryOrigin = width
+        if components.contains(.memory) { width += 14 }
         if components.contains(.network), width > 0 { width += 6 }
         let networkOrigin = width
         if components.contains(.network) { width += textAreaWidth }
@@ -116,7 +123,13 @@ enum StatusItemImage {
             let rect = NSRect(origin: .zero, size: size)
             context.clear(rect)
             context.saveGState()
-            if components.contains(.cpu) { drawCPU(cpuColor == nil ? nil : cpuPercent, color: cpuColor ?? foreground, in: context) }
+            if components.contains(.cpu) {
+                drawPie(cpuColor == nil ? nil : cpuPercent, origin: 0, color: cpuColor ?? foreground, in: context)
+            }
+            if components.contains(.memory) {
+                drawPie(memoryColor == nil ? nil : memoryValue, origin: memoryOrigin,
+                        color: memoryColor ?? foreground, in: context)
+            }
             context.textMatrix = .identity
             if components.contains(.network) {
                 for (index, line) in lines.enumerated() {
@@ -165,9 +178,10 @@ enum StatusItemImage {
         CTLineDraw(line, context)
     }
 
-    /// 沿用原 CPU 饼图坐标、扇区和透明度，仅替换有效占用对应的颜色；未知值保留中性短横线。
-    private static func drawCPU(_ percent: Double?, color: NSColor, in context: CGContext) {
-        let circle = CGRect(x: 0.5, y: 4.5, width: 13, height: 13)
+    /// CPU 和内存共用原有 13pt 饼图的扇区、描边和透明度，origin 只决定水平位置，不增加视图或动画。
+    /// 有效百分比从顶部顺时针填充；未知值保留中性短横线，与真实零占用区分。
+    private static func drawPie(_ percent: Double?, origin: CGFloat, color: NSColor, in context: CGContext) {
+        let circle = CGRect(x: origin + 0.5, y: 4.5, width: 13, height: 13)
         context.setFillColor(color.withAlphaComponent(0.12).cgColor)
         context.fillEllipse(in: circle)
         if let percent {

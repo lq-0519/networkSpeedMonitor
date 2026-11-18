@@ -164,7 +164,7 @@ final class SettingsController: NSWindowController {
         }
     }
 
-    /// 从持久化选择恢复三项状态；仅剩一项时禁止取消该项，其他选项仍可继续勾选。
+    /// 从持久化选择恢复各项状态；仅剩一项时禁止取消该项，其他选项仍可继续勾选。
     private func refreshMenuBarControls() {
         let selected = MenuBarPreferences.components
         for (component, toggle) in menuBarToggles {

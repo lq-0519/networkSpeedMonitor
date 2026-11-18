@@ -31,6 +31,13 @@ struct MemorySystemUsage: Codable {
     let usedBytes: UInt64
     /// 内核提供的当前内存压力等级。
     let pressure: MemoryPressureLevel
+
+    /// 菜单栏小饼图按整数百分比绘制，使同一取整区间内的细小波动复用绘图缓存。
+    /// 仅影响菜单栏图形精度，不改变原始字节数、弹窗或历史；总量无效时显示未知，异常已用量限制到物理总量。
+    var menuBarPercent: Int? {
+        guard totalBytes > 0 else { return nil }
+        return Int((Double(min(usedBytes, totalBytes)) / Double(totalBytes) * 100).rounded())
+    }
 }
 
 /// Mach VM 页统计的最小输入集合；独立计算函数便于验证溢出、回收页和容量边界。

@@ -4,6 +4,8 @@ import Foundation
 enum MenuBarComponent: String, CaseIterable {
     /// 保留现有的整机 CPU 饼图。
     case cpu
+    /// 在 CPU 右侧显示整机已用内存比例，复用已有轻量采样。
+    case memory
     /// 保留现有的上行、下行两行网速。
     case network
     /// 显示电量百分比及充满时间、续航或系统充电状态。
@@ -13,6 +15,7 @@ enum MenuBarComponent: String, CaseIterable {
     var title: String {
         switch self {
         case .cpu: return "CPU"
+        case .memory: return "内存"
         case .network: return "网络速度"
         case .battery: return "电池"
         }
@@ -23,8 +26,10 @@ enum MenuBarComponent: String, CaseIterable {
 enum MenuBarPreferences {
     /// 固定 Bundle ID 下的独立偏好键，不覆盖既有采样间隔或排行设置。
     private static let key = "menuBarComponents"
+    /// 只迁移一次旧版菜单栏选择，之后尊重用户主动关闭内存的选择。
+    private static let memoryMigrationKey = "menuBarMemoryMigrationCompleted"
 
-    /// 首次使用或配置损坏时显示全部三项，使新增电池信息直接可见。
+    /// 首次使用或配置损坏时显示 CPU、内存、网络和电池四项。
     static var components: Set<MenuBarComponent> {
         validated(UserDefaults.standard.array(forKey: key) as? [String])
     }
@@ -33,6 +38,17 @@ enum MenuBarPreferences {
     static func validated(_ values: [String]?) -> Set<MenuBarComponent> {
         let selected = Set((values ?? []).compactMap(MenuBarComponent.init(rawValue:)))
         return selected.isEmpty ? Set(MenuBarComponent.allCases) : selected
+    }
+
+    /// 启动时仅执行一次：为原先显示 CPU 的配置加入内存，保留其他选择；原先隐藏 CPU 的精简配置保持原样。
+    /// 迁移完成后持久化标记，避免用户关闭内存后在下次启动被重新打开；不在每轮刷新时读取或写入标记。
+    static func migrateMemoryComponentIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: memoryMigrationKey) else { return }
+        var selected = components
+        if selected.contains(.cpu) { selected.insert(.memory) }
+        setComponents(selected)
+        defaults.set(true, forKey: memoryMigrationKey)
     }
 
     /// 按固定顺序保存用户选择；空集合被拒绝，调用方应恢复最后一个勾选。
