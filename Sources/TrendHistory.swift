@@ -28,7 +28,7 @@ enum TrendRange: Int, CaseIterable {
     }
 }
 
-/// 历史库的稳定列编号；只保存整机标量，不保存进程、应用或网络连接明细。
+/// 整机趋势表的稳定列编号；应用写入摘要存放在独立的时间窗口表。
 enum TrendMetric: Int, CaseIterable {
     /// 整机 CPU 非空闲时间百分比。
     case cpu
@@ -112,8 +112,96 @@ struct TrendSnapshot {
     let series: [TrendMetric: [TrendPoint]]
     /// 读取包含的最后一个样本标识，迟到的实时通知可据此去重。
     let watermark: Int64
+    /// 本次查询的实际结束时间；磁盘排行沿用同一个端点读取写入量。
+    let end: TimeInterval
     /// 数据库不可读时仍返回内存曲线，并解释较早历史缺失。
     let error: String?
+}
+
+/// 某个应用或独立进程在采样窗口内的写入字节。
+struct DiskWriteTotal: Codable {
+    /// 应用归属键或独立进程键，用于跨窗口合并同一个写入者。
+    let key: String
+    /// 记录时的可读名称，进程退出后仍可显示历史。
+    let name: String
+    /// App 包路径供界面加载图标，普通进程可以没有。
+    let bundlePath: String?
+    /// 已归属的整数字节数，保留原始计数精度。
+    let bytes: UInt64
+}
+
+/// 指定时间段内的写入榜单和实际采样覆盖。
+struct DiskWriteHistorySnapshot {
+    /// 完整汇总后按字节降序截取的应用列表。
+    let rows: [DiskWriteTotal]
+    /// 有效采样窗口在请求范围内的并集长度，包括有效的零写入时段。
+    let coveredSeconds: TimeInterval
+    /// 所选范围截断了有写入的采样窗口，此时边界字节按时间比例估算。
+    let estimated: Bool
+    /// 数据库暂不可用时仍返回缓冲中的数据，并说明可查询历史受限。
+    let error: String?
+}
+
+/// 两次有效进程快照之间的覆盖和已汇总写入，按整窗写入一行，减少数据库页和索引更新。
+private struct DiskWriteWindow {
+    /// 上一个有效快照的 Unix 时间。
+    let start: TimeInterval
+    /// 当前有效快照的 Unix 时间。
+    let end: TimeInterval
+    /// 有实际写入的应用；空列表仍表示有效采集。
+    let totals: [DiskWriteTotal]
+}
+
+/// 读取磁盘窗口时在线聚合写入，最后合并相互重叠的覆盖范围。
+private struct DiskWriteQuery {
+    /// 所选时间段起点。
+    let start: TimeInterval
+    /// 所选时间段终点。
+    let end: TimeInterval
+    /// 已裁剪到查询范围的有效覆盖窗口。
+    private var coverage: [Range<TimeInterval>] = []
+    /// 以应用归属键合并后的累计字节和展示信息。
+    private var totals: [String: DiskWriteTotal] = [:]
+    /// 是否有非零写入落在部分重叠的窗口。
+    private var estimated = false
+
+    /// 初始化边界固定的查询，已落库数据和内存缓冲共享同一范围。
+    init(start: TimeInterval, end: TimeInterval) {
+        self.start = start; self.end = end
+    }
+
+    /// 合并一个有效窗口；重叠边界按持续时间比例折算，其余字节精确累加。
+    mutating func add(_ window: DiskWriteWindow) {
+        let lower = max(start, window.start), upper = min(end, window.end)
+        guard lower < upper else { return }
+        coverage.append(lower..<upper)
+        let isPartial = lower != window.start || upper != window.end
+        let fraction = (upper - lower) / (window.end - window.start)
+        estimated = estimated || (isPartial && !window.totals.isEmpty)
+        for total in window.totals {
+            let bytes = isPartial ? (UInt64(exactly: (Double(total.bytes) * fraction).rounded()) ?? total.bytes) : total.bytes
+            guard bytes > 0 else { continue }
+            let sum = (totals[total.key]?.bytes ?? 0).addingReportingOverflow(bytes)
+            totals[total.key] = DiskWriteTotal(key: total.key, name: total.name, bundlePath: total.bundlePath,
+                                             bytes: sum.overflow ? .max : sum.partialValue)
+        }
+    }
+
+    /// 合并重复覆盖并在完整汇总之后截取排行，避免遗漏跨窗口逐步累积的应用。
+    func snapshot(limit: Int, error: String?) -> DiskWriteHistorySnapshot {
+        var coveredSeconds: TimeInterval = 0
+        var coveredUntil = start
+        for span in coverage.sorted(by: { $0.lowerBound < $1.lowerBound }) where span.upperBound > coveredUntil {
+            coveredSeconds += span.upperBound - max(span.lowerBound, coveredUntil)
+            coveredUntil = span.upperBound
+        }
+        let rows = totals.values.sorted {
+            if $0.bytes != $1.bytes { return $0.bytes > $1.bytes }
+            let order = $0.name.localizedStandardCompare($1.name)
+            return order == .orderedSame ? $0.key < $1.key : order == .orderedAscending
+        }.prefix(max(0, limit))
+        return DiskWriteHistorySnapshot(rows: Array(rows), coveredSeconds: coveredSeconds, estimated: estimated, error: error)
+    }
 }
 
 /// 按稳定时间桶保留首点、末点和真实最小最大值；增量压缩不会抹掉已保留的尖峰。
@@ -159,7 +247,7 @@ enum TrendDownsampler {
     }
 }
 
-/// 本地二十四小时标量历史；单一串行队列拥有连接、缓冲和事务，读取不会遇到提交中的空档。
+/// 本地二十四小时资源历史；单一串行队列拥有连接、缓冲和事务，读取不会遇到提交中的空档。
 final class TrendHistoryStore {
     /// 主线程上的有效采样通知，仅当前可见趋势页订阅绘图。
     var onAppend: ((TrendSample) -> Void)?
@@ -169,6 +257,8 @@ final class TrendHistoryStore {
     private var database: OpaquePointer?
     /// 成功 COMMIT 前始终保留原样本；写入失败不会提前清空。
     private var pending: [TrendSample] = []
+    /// 尚未随整机样本提交的磁盘写入窗口；写盘失败时保留最近的记录。
+    private var pendingDiskWrites: [DiskWriteWindow] = []
     /// 从库中最大标识继续递增；同一进程内不会因重试产生重复标识。
     private var nextID: Int64 = 0
     /// 连接初始化是否已经成功，以区分首次读取与失败重试。
@@ -188,6 +278,8 @@ final class TrendHistoryStore {
     private var observedMask: Int64 = 0
     /// 数据库失败时的有界缓冲上限，不让常驻内存无限增长。
     private static let maximumPending = 8192
+    /// 写入窗口可包含多个应用，单独限制积压窗口数以约束存储故障时的内存。
+    private static let maximumPendingDiskWrites = 512
     /// 所有查询严格裁剪二十四小时，物理删除可比查询边界晚至下一次低频清理。
     private static let retention: TimeInterval = 86400
 
@@ -213,6 +305,65 @@ final class TrendHistoryStore {
                 DispatchQueue.main.async { [weak self] in self?.onAppend?(sample) }
             }
         }
+    }
+
+    /// 缓冲已归属的磁盘字节和有效覆盖；连续零写入窗口合并，等待既有批次统一写盘。
+    func appendDiskWrites(start: TimeInterval, end: TimeInterval, totals: [DiskWriteTotal]) {
+        guard start.isFinite, end.isFinite, start < end else { return }
+        queue.async { [self] in
+            let nonzero = totals.filter { $0.bytes > 0 }
+            if nonzero.isEmpty, let last = pendingDiskWrites.last, last.totals.isEmpty, last.end == start {
+                pendingDiskWrites[pendingDiskWrites.count - 1] = DiskWriteWindow(start: last.start, end: end, totals: [])
+            } else {
+                pendingDiskWrites.append(DiskWriteWindow(start: start, end: end, totals: nonzero))
+                if pendingDiskWrites.count > Self.maximumPendingDiskWrites {
+                    pendingDiskWrites.removeFirst(pendingDiskWrites.count - Self.maximumPendingDiskWrites)
+                }
+            }
+        }
+    }
+
+    /// 在同一队列中合并持久化记录与尚未提交的窗口，查询时裁剪到请求边界和保留上限。
+    func loadDiskWrites(start: TimeInterval, end: TimeInterval, limit: Int,
+                        completion: @escaping (DiskWriteHistorySnapshot) -> Void) {
+        queue.async { [self] in
+            var query = DiskWriteQuery(start: max(start, end - Self.retention), end: end)
+            var error: String? = writeFailed ? "近期写入历史暂时无法保存" : nil
+            if query.start.isFinite, query.end.isFinite, query.start < query.end {
+                if !openDatabase() || !readDiskWrites(into: &query) { error = "暂时无法读取磁盘写入历史" }
+                for window in pendingDiskWrites { query.add(window) }
+            }
+            let snapshot = query.snapshot(limit: limit, error: error)
+            DispatchQueue.main.async { completion(snapshot) }
+        }
+    }
+
+    /// 顺序读取与指定时间相交的落库窗口；空值载荷表示本窗口确实采样且写入为零。
+    private func readDiskWrites(into query: inout DiskWriteQuery) -> Bool {
+        guard let database else { return false }
+        let sql = "SELECT start,end,totals FROM disk_write_windows WHERE end > ? AND start < ? ORDER BY end"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return false }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_bind_double(statement, 1, query.start) == SQLITE_OK,
+              sqlite3_bind_double(statement, 2, query.end) == SQLITE_OK else { return false }
+        let decoder = JSONDecoder()
+        var allReadable = true
+        var status = sqlite3_step(statement)
+        while status == SQLITE_ROW {
+            let start = sqlite3_column_double(statement, 0), end = sqlite3_column_double(statement, 1)
+            if sqlite3_column_type(statement, 2) == SQLITE_NULL {
+                query.add(DiskWriteWindow(start: start, end: end, totals: []))
+            } else if let data = sqlite3_column_blob(statement, 2),
+                      let totals = try? decoder.decode([DiskWriteTotal].self,
+                          from: Data(bytes: data, count: Int(sqlite3_column_bytes(statement, 2)))) {
+                query.add(DiskWriteWindow(start: start, end: end, totals: totals))
+            } else {
+                allReadable = false
+            }
+            status = sqlite3_step(statement)
+        }
+        return allReadable && status == SQLITE_DONE
     }
 
     /// 二级页面切换时在同一串行队列更新订阅；关闭页面后不再投递其曲线样本。
@@ -281,7 +432,7 @@ final class TrendHistoryStore {
                 series[metric] = metric.usesWindowBounds || sorted.count <= 800
                     ? sorted : TrendDownsampler.reduce(sorted, since: start, range: range)
             }
-            let snapshot = TrendSnapshot(series: series, watermark: nextID, error: error)
+            let snapshot = TrendSnapshot(series: series, watermark: nextID, end: end, error: error)
             DispatchQueue.main.async { completion(snapshot) }
         }
     }
@@ -323,7 +474,15 @@ final class TrendHistoryStore {
                   let opened else { throw CocoaError(.fileWriteUnknown) }
             sqlite3_busy_timeout(opened, 150)
             let columns = TrendMetric.allCases.map { "\($0.column) REAL" }.joined(separator: ",")
-            let schema = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA wal_autocheckpoint=256; CREATE TABLE IF NOT EXISTS samples(id INTEGER PRIMARY KEY,time REAL NOT NULL,segment TEXT NOT NULL,spacing REAL NOT NULL,mask INTEGER NOT NULL,estimated INTEGER NOT NULL,\(columns)); CREATE INDEX IF NOT EXISTS samples_time ON samples(time);"
+            let schema = """
+                PRAGMA journal_mode=WAL;
+                PRAGMA synchronous=NORMAL;
+                PRAGMA wal_autocheckpoint=256;
+                CREATE TABLE IF NOT EXISTS samples(id INTEGER PRIMARY KEY,time REAL NOT NULL,segment TEXT NOT NULL,spacing REAL NOT NULL,mask INTEGER NOT NULL,estimated INTEGER NOT NULL,\(columns));
+                CREATE INDEX IF NOT EXISTS samples_time ON samples(time);
+                CREATE TABLE IF NOT EXISTS disk_write_windows(start REAL NOT NULL,end REAL NOT NULL,totals BLOB);
+                CREATE INDEX IF NOT EXISTS disk_write_end ON disk_write_windows(end);
+                """
             guard sqlite3_exec(opened, schema, nil, nil, nil) == SQLITE_OK else { throw CocoaError(.fileWriteUnknown) }
             if !initialized {
                 var statement: OpaquePointer?
@@ -354,32 +513,67 @@ final class TrendHistoryStore {
         guard openDatabase(), let database else { writeFailed = true; return }
         let now = Date().timeIntervalSince1970
         pending.removeAll { $0.time < now - Self.retention }
-        if !pending.isEmpty {
-            let columns = TrendMetric.allCases.map(\.column)
-            let placeholders = Array(repeating: "?", count: 6 + columns.count).joined(separator: ",")
-            let sql = "INSERT OR IGNORE INTO samples(id,time,segment,spacing,mask,estimated,\(columns.joined(separator: ","))) VALUES(\(placeholders))"
-            var statement: OpaquePointer?
-            guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else { writeFailed = true; return }
-            defer { sqlite3_finalize(statement) }
+        pendingDiskWrites.removeAll { $0.end <= now - Self.retention }
+        if !pending.isEmpty || !pendingDiskWrites.isEmpty {
             guard sqlite3_exec(database, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else { writeFailed = true; return }
-            var succeeded = true
-            for sample in pending {
-                sqlite3_reset(statement); sqlite3_clear_bindings(statement)
-                sqlite3_bind_int64(statement, 1, sample.id); sqlite3_bind_double(statement, 2, sample.time)
-                _ = sample.segment.withCString { sqlite3_bind_text(statement, 3, $0, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
-                sqlite3_bind_double(statement, 4, sample.spacing)
-                sqlite3_bind_int64(statement, 5, sample.values.reduce(0) { $0 | $1.metric.mask })
-                sqlite3_bind_int64(statement, 6, sample.values.filter(\.estimated).reduce(0) { $0 | $1.metric.mask })
-                for value in sample.values {
-                    if let number = value.value { sqlite3_bind_double(statement, Int32(value.metric.rawValue + 7), number) }
-                }
-                if sqlite3_step(statement) != SQLITE_DONE { succeeded = false; break }
-            }
-            if succeeded && sqlite3_exec(database, "COMMIT", nil, nil, nil) == SQLITE_OK {
-                pending.removeAll(keepingCapacity: true); writeFailed = false
+            if writePendingSamples(to: database), writePendingDiskWrites(to: database),
+               sqlite3_exec(database, "COMMIT", nil, nil, nil) == SQLITE_OK {
+                pending.removeAll(keepingCapacity: true)
+                pendingDiskWrites.removeAll(keepingCapacity: true)
+                writeFailed = false
             } else { sqlite3_exec(database, "ROLLBACK", nil, nil, nil); writeFailed = true }
         }
         cleanup(now: now)
+    }
+
+    /// 写入整机标量缓冲；事务由提交方管理，使原始趋势与磁盘窗口共享一次提交。
+    private func writePendingSamples(to database: OpaquePointer) -> Bool {
+        guard !pending.isEmpty else { return true }
+        let columns = TrendMetric.allCases.map(\.column)
+        let placeholders = Array(repeating: "?", count: 6 + columns.count).joined(separator: ",")
+        let sql = "INSERT OR IGNORE INTO samples(id,time,segment,spacing,mask,estimated,\(columns.joined(separator: ","))) VALUES(\(placeholders))"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return false }
+        defer { sqlite3_finalize(statement) }
+        for sample in pending {
+            sqlite3_reset(statement); sqlite3_clear_bindings(statement)
+            sqlite3_bind_int64(statement, 1, sample.id); sqlite3_bind_double(statement, 2, sample.time)
+            _ = sample.segment.withCString { sqlite3_bind_text(statement, 3, $0, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
+            sqlite3_bind_double(statement, 4, sample.spacing)
+            sqlite3_bind_int64(statement, 5, sample.values.reduce(0) { $0 | $1.metric.mask })
+            sqlite3_bind_int64(statement, 6, sample.values.filter(\.estimated).reduce(0) { $0 | $1.metric.mask })
+            for value in sample.values {
+                if let number = value.value { sqlite3_bind_double(statement, Int32(value.metric.rawValue + 7), number) }
+            }
+            guard sqlite3_step(statement) == SQLITE_DONE else { return false }
+        }
+        return true
+    }
+
+    /// 将每个采样窗口写成一行；窗口内非零 App 的字节合并保存，零写入只保存覆盖。
+    private func writePendingDiskWrites(to database: OpaquePointer) -> Bool {
+        guard !pendingDiskWrites.isEmpty else { return true }
+        let sql = "INSERT INTO disk_write_windows(start,end,totals) VALUES(?,?,?)"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return false }
+        defer { sqlite3_finalize(statement) }
+        let encoder = JSONEncoder()
+        for window in pendingDiskWrites {
+            sqlite3_reset(statement)
+            guard sqlite3_bind_double(statement, 1, window.start) == SQLITE_OK,
+                  sqlite3_bind_double(statement, 2, window.end) == SQLITE_OK else { return false }
+            if window.totals.isEmpty {
+                guard sqlite3_bind_null(statement, 3) == SQLITE_OK else { return false }
+            } else {
+                guard let data = try? encoder.encode(window.totals), let size = Int32(exactly: data.count) else { return false }
+                let status = data.withUnsafeBytes {
+                    sqlite3_bind_blob(statement, 3, $0.baseAddress, size, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+                }
+                guard status == SQLITE_OK else { return false }
+            }
+            guard sqlite3_step(statement) == SQLITE_DONE else { return false }
+        }
+        return true
     }
 
     /// 启动与每小时删除过期行，重用空闲页；不在采样路径执行全库 VACUUM。
@@ -387,25 +581,32 @@ final class TrendHistoryStore {
     private func cleanup(now: TimeInterval) {
         let uptime = ProcessInfo.processInfo.systemUptime
         guard let database, lastCleanup == 0 || uptime - lastCleanup >= 3600 else { return }
-        var statement: OpaquePointer?
-        var status = sqlite3_prepare_v2(database, "DELETE FROM samples WHERE time < ?", -1, &statement, nil)
-        defer {
-            let durationMilliseconds = (ProcessInfo.processInfo.systemUptime - uptime) * 1000
-            let cleanupTime = ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: now))
-            // 在 finalize 前读取受影响行数和错误，避免后续 SQLite 调用覆盖本次清理的结果。
-            if status == SQLITE_DONE {
-                let deletedRows = sqlite3_changes(database)
-                logger.notice("History cleanup succeeded: time=\(cleanupTime, privacy: .public) deleted_rows=\(deletedRows) duration_ms=\(durationMilliseconds)")
-            } else {
-                let message = String(cString: sqlite3_errmsg(database))
-                logger.error("History cleanup failed: time=\(cleanupTime, privacy: .public) deleted_rows=0 duration_ms=\(durationMilliseconds) sqlite_code=\(status) error=\(message, privacy: .public)")
-            }
-            if let statement { sqlite3_finalize(statement) }
+        let cutoff = now - Self.retention
+        var status = deleteExpired("DELETE FROM samples WHERE time < ?", before: cutoff, from: database)
+        let deletedRows = status == SQLITE_DONE ? sqlite3_changes(database) : 0
+        if status == SQLITE_DONE {
+            status = deleteExpired("DELETE FROM disk_write_windows WHERE end <= ?", before: cutoff, from: database)
         }
-        guard status == SQLITE_OK, let statement else { return }
-        status = sqlite3_bind_double(statement, 1, now - Self.retention)
-        guard status == SQLITE_OK else { return }
-        status = sqlite3_step(statement)
-        if status == SQLITE_DONE { lastCleanup = uptime }
+        let durationMilliseconds = (ProcessInfo.processInfo.systemUptime - uptime) * 1000
+        let cleanupTime = ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: now))
+        if status == SQLITE_DONE {
+            lastCleanup = uptime
+            let deletedWindows = sqlite3_changes(database)
+            logger.notice("History cleanup succeeded: time=\(cleanupTime, privacy: .public) deleted_rows=\(deletedRows) deleted_disk_windows=\(deletedWindows) duration_ms=\(durationMilliseconds)")
+        } else {
+            let message = String(cString: sqlite3_errmsg(database))
+            logger.error("History cleanup failed: time=\(cleanupTime, privacy: .public) deleted_rows=\(deletedRows) duration_ms=\(durationMilliseconds) sqlite_code=\(status) error=\(message, privacy: .public)")
+        }
+    }
+
+    /// 执行固定 SQL 的保留清理，使用同一截止时间以处理跨查询窗口的历史。
+    private func deleteExpired(_ sql: String, before cutoff: TimeInterval, from database: OpaquePointer) -> Int32 {
+        var statement: OpaquePointer?
+        let prepareStatus = sqlite3_prepare_v2(database, sql, -1, &statement, nil)
+        guard prepareStatus == SQLITE_OK, let statement else { return prepareStatus }
+        defer { sqlite3_finalize(statement) }
+        let bindStatus = sqlite3_bind_double(statement, 1, cutoff)
+        guard bindStatus == SQLITE_OK else { return bindStatus }
+        return sqlite3_step(statement)
     }
 }

@@ -316,6 +316,23 @@ enum Diagnostics {
         check(disk.consume(diskSnapshot(200, read: 50, write: 80, start: 20, privileged: false)) == nil, "磁盘休眠后不跨长窗口差分")
         disk.reset()
         check(disk.consume(diskSnapshot(202, read: 60, write: 90)) == nil, "关闭磁盘详情后首帧重新建基线")
+        let diskWrites = DiskWriteAccumulator(), diskResolver = ApplicationResolver()
+        /// 固定两个时钟并注入累计字节，用时间段测试覆盖写入首帧、计数变化及系统时间跳变。
+        func recordDiskWrites(_ uptime: TimeInterval, _ bytes: UInt64, start: UInt64 = 10,
+                              wallTime: TimeInterval? = nil) -> (start: TimeInterval, end: TimeInterval, totals: [DiskWriteTotal])? {
+            diskWrites.consume(diskSnapshot(uptime, read: 0, write: bytes, start: start), resolver: diskResolver,
+                               time: Date(timeIntervalSince1970: wallTime ?? 1_000 + uptime), receivedUptime: uptime)
+        }
+        check(recordDiskWrites(100, 100_000) == nil, "磁盘写入历史仅用第一帧建立基线")
+        check(recordDiskWrites(100, 100_000) == nil, "重复的管理员缓存快照不生成新的写入窗口")
+        let writeInterval = recordDiskWrites(110, 125_000)
+        check(writeInterval?.start == 1_100 && writeInterval?.end == 1_110 && writeInterval?.totals.first?.bytes == 25_000,
+              "磁盘写入历史按实际窗口累加字节增量")
+        check(recordDiskWrites(120, 125_000)?.totals.isEmpty == true, "零写入保留有效的采集时段")
+        check(recordDiskWrites(130, 200_000, start: 20)?.totals.isEmpty == true, "磁盘写入历史区分 PID 重用")
+        check(recordDiskWrites(140, 225_000, start: 20, wallTime: 1_600) == nil, "系统时间跳变不生成磁盘写入历史")
+        diskWrites.reset()
+        check(recordDiskWrites(150, 300_000, start: 20, wallTime: 1_610) == nil, "暂停或停用后重新建立磁盘写入基线")
         let legacyData = try! JSONEncoder().encode(snapshot(204, ticks: 1))
         let legacy = try! JSONDecoder().decode(CPUProcessSnapshot.self, from: legacyData)
         check(legacy.diskProcesses == nil && legacy.memoryProcesses == nil && legacy.processes.count == 1,

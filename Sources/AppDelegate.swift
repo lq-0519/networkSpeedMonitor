@@ -5,8 +5,8 @@ import CoreGraphics
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// 全应用共享一个模型，菜单栏和弹窗不会各自重复采集总量。
     private let monitor = NetworkMonitor()
-    /// CPU 与网络共用应用生命周期，详情采样各自按需启停。
-    private let cpu = CPUMonitor()
+    /// CPU 详情和时段写入共用一条进程采集链路，后者同整机趋势保存到同一历史库。
+    private lazy var cpu = CPUMonitor(history: history)
     /// 电源与风扇仅在弹窗展开期间同轮采样，不参与菜单栏内容或常驻刷新。
     private let power = PowerMonitor()
     /// 菜单栏电池独立接收系统电源通知，不带动弹窗功率、风扇或历史读取。
@@ -201,6 +201,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             self.closePopover()
             self.settings.onCPUAuthorization = { [weak self] in self?.authorizeCPU() }
             self.settings.onMenuBarChange = { [weak self] in self?.applyMenuBarPreferences() }
+            self.settings.onDiskWriteHistoryChange = { [weak self] in
+                self?.cpu.setDiskHistoryEnabled(DiskWriteHistoryPreferences.isEnabled)
+            }
             self.settings.present()
         }
         panel.onAuthorize = { [weak self] in self?.authorizeCPU() }
@@ -236,7 +239,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if popover.contentSize != size { popover.contentSize = size }
     }
 
-    /// 统一面板关闭时停止详细采样与全部排行，释放辅助连接；后台整机趋势恢复低频读取。
+    /// 统一面板关闭时停止实时排行；启用时段写入后由同一采集器继续低频记录。
     func popoverDidClose(_ notification: Notification) {
         guard !popover.isShown else { return }
         stopPopoverEventMonitoring()

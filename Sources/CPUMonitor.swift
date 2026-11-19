@@ -16,8 +16,20 @@ struct CPUApplicationUsage {
     var processes: [CPUProcessUsage]
 }
 
-/// 低频原生 CPU 采样；全机统计常驻，完整进程列表只在 CPU 面板可见时请求。
+/// 低频原生 CPU 采样；整机趋势、实时排行与可选磁盘历史共用一次计时唤醒和进程请求。
 final class CPUMonitor {
+    /// 每次配置同时记录 UI 是否消费快照和是否写入历史；只有已安装管理员服务才启用历史采集。
+    private struct ProcessRequest {
+        /// 当前配置的世代，用于拒绝旧定时事件和已入队的 UI 回调。
+        let epoch: UUID
+        /// 使用经过签名和权限校验的管理员连接；普通权限只供原有实时排行回退。
+        let helper: Bool
+        /// 弹窗可见时才进行 CPU 排序及主线程发布。
+        let visible: Bool
+        /// 启用后同一快照也用于磁盘写入累计。
+        let recordsDiskWrites: Bool
+    }
+
     /// 主线程数据变化通知，驱动菜单栏及当前可见面板。
     var onUpdate: (() -> Void)?
     /// 仅真实整机计数采样触发，设置、排行和界面刷新不会重复写入历史。
@@ -54,12 +66,14 @@ final class CPUMonitor {
     var interval: Int { SamplingPreferences.interval }
     /// 低成本整机统计独立运行，不被普通权限进程枚举或应用归类阻塞。
     private let systemQueue = DispatchQueue(label: "com.local.NetworkSpeedMonitor.cpu.system", qos: .utility)
-    /// 仅在用户查看详情时工作，低优先级串行计算；主线程只接收最终排行。
+    /// 低优先级串行处理进程快照；后台记录不经过主线程。
     private let rankingQueue = DispatchQueue(label: "com.local.NetworkSpeedMonitor.cpu.ranking", qos: .utility)
     /// 整机和详情共用一个带容差的定时器，避免重复唤醒。
     private var timer: DispatchSourceTimer?
-    /// 仅由 systemQueue 访问；详情关闭后不再向排行队列投递周期性空任务。
-    private var rankingEnabled = false
+    /// 仅由 systemQueue 访问，按已有 1、2、5 秒周期计步，隐藏时约每十秒才投递一个采样任务。
+    private var processSchedule: (epoch: UUID, stride: Int, remaining: Int)?
+    /// 后台写入记录复用整机定时器，全局周期的三档均可整除这一间隔。
+    private static let backgroundDiskInterval = 10
     /// 四个整机状态计数器。
     private let systemReader = CPUSystemReader()
     /// 未授权时仍可显示当前用户的进程，并明确标注覆盖不足。
@@ -70,6 +84,12 @@ final class CPUMonitor {
     private let client = CPUPrivilegedClient()
     /// 应用归属缓存仅由 rankingQueue 使用，首次读取 App 元数据也不会阻塞界面。
     private let resolver = ApplicationResolver()
+    /// 仅 GUI 注入持久化历史；现有有限时长的诊断入口照常只读。
+    private let history: TrendHistoryStore?
+    /// 独立保存写入计数基线，使前后台切换及实时排行基线重置时保持连续。
+    private let diskWriter = DiskWriteAccumulator()
+    /// 主线程上的用户选择，关掉弹窗后仍可按需记录。
+    private var diskHistoryEnabled: Bool
     /// 主线程上的面板可见状态。
     private var visible = false
     /// 主线程上的系统暂停状态。
@@ -78,16 +98,22 @@ final class CPUMonitor {
     private var systemEpoch = UUID()
     /// 详情世代，关闭面板时立即失效。
     private var rankingEpoch = UUID()
-    /// 队列中的详情配置，nil 表示不采集任何进程。
-    private var rankingRequest: (epoch: UUID, helper: Bool)?
+    /// 采样队列中的当前请求配置，nil 表示不采集任何进程。
+    private var rankingRequest: ProcessRequest?
     /// 单个请求及延迟提示、最终超时任务；等待期间不重复发送进程枚举请求。
-    private var pending: (id: UUID, delayed: DispatchWorkItem, timeout: DispatchWorkItem)?
+    private var pending: (id: UUID, delayed: DispatchWorkItem?, timeout: DispatchWorkItem)?
     /// 当前连接是否已经成功返回快照；新建或失效连接使用更长的启动等待期限。
     private var helperReady = false
     /// 本轮详情连续失败次数，决定有限的重连退避；成功采样后清零。
     private var retryFailures = 0
     /// 下次允许重连的单调时刻，现有整机采样定时器负责到期后发起请求。
     private var retryNotBefore: TimeInterval = 0
+
+    /// 主程序提供可选历史库，诊断实例维持现有按需采集行为。
+    init(history: TrendHistoryStore? = nil) {
+        self.history = history
+        diskHistoryEnabled = history != nil && DiskWriteHistoryPreferences.isEnabled
+    }
 
     /// 显式诊断参数才输出生命周期，不在常驻运行时写入每帧日志。
     private func trace(_ message: String) {
@@ -115,9 +141,7 @@ final class CPUMonitor {
                     self.onSystemSample?(value, sampledAt, uptime, seconds)
                     self.usage = value; self.onUpdate?()
                 }
-                if self.rankingEnabled {
-                    self.rankingQueue.async { [weak self] in self?.sampleRanking() }
-                }
+                self.scheduleProcessSample()
             }
             timer = source; source.resume()
         }
@@ -125,10 +149,16 @@ final class CPUMonitor {
         onUpdate?()
     }
 
-    /// 展开立即记录一次进程基线；收起取消请求、释放缓存及管理员连接。
+    /// 展开立即建立实时基线；收起时按历史记录设置降频或关闭连接。
     func setRankingVisible(_ value: Bool) {
         guard visible != value else { return }
         visible = value; configureRanking()
+    }
+
+    /// 设置变更通过同一采样配置生效，关闭记录时即丢弃历史差分基线。
+    func setDiskHistoryEnabled(_ value: Bool) {
+        guard history != nil, diskHistoryEnabled != value else { return }
+        diskHistoryEnabled = value; configureRanking()
     }
 
     /// 复用全应用的锁屏/睡眠状态，暂停期间不保留活动采样任务。
@@ -138,12 +168,18 @@ final class CPUMonitor {
     }
 
     /// 授权安装成功后刷新连接和差分基线，防止混合普通权限与管理员结果。
-    func authorizationChanged() { configureRanking() }
+    func authorizationChanged() { configureRanking(resetConnection: true) }
 
     /// 根据主线程界面状态生成一份不可变采集配置，过期回调无法污染新面板。
-    private func configureRanking() {
+    private func configureRanking(resetConnection: Bool = false) {
         let epoch = UUID(); rankingEpoch = epoch
-        let enabled = visible && !suspended, helper = CPUPrivilege.isInstalled
+        let enabled = visible && !suspended
+        let wantsHistory = diskHistoryEnabled && !suspended
+        let helper = (enabled || wantsHistory) && CPUPrivilege.isInstalled
+        let recordsDiskWrites = wantsHistory && helper
+        let request = enabled || recordsDiskWrites
+            ? ProcessRequest(epoch: epoch, helper: helper, visible: enabled, recordsDiskWrites: recordsDiskWrites)
+            : nil
         trace("configure visible=\(visible) suspended=\(suspended) helper=\(helper) epoch=\(epoch)")
         applications = []; readableProcesses = 0; deniedProcesses = 0; privileged = false
         rankingSampleTime = nil; rankingRequestDuration = nil; rankingCollectionDuration = nil
@@ -151,70 +187,122 @@ final class CPUMonitor {
         rankingStatus = collectionStatus.message; isRankingStale = false
         rankingRevision += 1
         onProcessSnapshot?(nil, collectionStatus)
-        systemQueue.async { [self] in rankingEnabled = enabled }
+        let stride = enabled ? 1 : Self.backgroundDiskInterval / interval
+        systemQueue.async { [self] in
+            processSchedule = request.map { ($0.epoch, stride, stride) }
+        }
         rankingQueue.async { [self] in
-            pending?.delayed.cancel(); pending?.timeout.cancel(); pending = nil
-            client.close(); accumulator.reset(); localReader.reset(); resolver.clear()
-            helperReady = false; retryFailures = 0; retryNotBefore = 0
-            rankingRequest = enabled ? (epoch, helper) : nil
-            if enabled { sampleRanking() }
+            let old = rankingRequest
+            let restarts = resetConnection || request == nil || old?.helper != request?.helper
+            if restarts {
+                closeProcessSource(); localReader.reset(); resolver.clear()
+            }
+            accumulator.reset()
+            if restarts || !recordsDiskWrites || old?.recordsDiskWrites != true {
+                diskWriter.reset()
+            }
+            rankingRequest = request
+            if enabled || (recordsDiskWrites && (restarts || old?.recordsDiskWrites != true)) {
+                sampleRanking()
+            }
         }
         onUpdate?()
     }
 
-    /// 仅由采样队列调用；详情隐藏时快速返回，不枚举进程或唤醒管理员服务。
+    /// 在整机计时队列先限频；休眠后重新配置步数，未启用记录时不向采样队列投递空任务。
+    private func scheduleProcessSample() {
+        guard var schedule = processSchedule else { return }
+        schedule.remaining -= 1
+        if schedule.remaining == 0 {
+            schedule.remaining = schedule.stride
+            let epoch = schedule.epoch
+            rankingQueue.async { [weak self] in
+                guard let self, self.rankingRequest?.epoch == epoch else { return }
+                self.sampleRanking()
+            }
+        }
+        processSchedule = schedule
+    }
+
+    /// 仅由采样队列调用；实时排行和后台记录共用一个在途请求、连接与退避策略。
     private func sampleRanking() {
         guard let request = rankingRequest, pending == nil,
               ProcessInfo.processInfo.systemUptime >= retryNotBefore else { return }
-        if !request.helper { receive(localReader.snapshot(), epoch: request.epoch); return }
+        if !request.helper { receive(localReader.snapshot(), request: request); return }
         let id = UUID(), began = ProcessInfo.processInfo.systemUptime
-        let delayed = DispatchWorkItem { [weak self] in
+        let delayed = request.visible ? DispatchWorkItem { [weak self] in
             guard let self, self.pending?.id == id else { return }
-            self.publishStatus(.retrying("采集延迟，正在等待服务响应。"), epoch: request.epoch)
-        }
+            self.publishProcessStatus(.retrying("采集延迟，正在等待服务响应。"))
+        } : nil
         let timeout = DispatchWorkItem { [weak self] in
             guard let self, self.pending?.id == id else { return }
-            self.pending?.delayed.cancel(); self.pending = nil
-            self.scheduleRetry(.retrying("采集超时，正在自动重试。"), epoch: request.epoch)
+            self.pending?.delayed?.cancel(); self.pending = nil
+            self.scheduleRetry(.retrying("采集超时，正在自动重试。"))
         }
         pending = (id, delayed, timeout)
-        rankingQueue.asyncAfter(deadline: .now() + CPURequestTiming.delayedAfter, execute: delayed)
+        if let delayed { rankingQueue.asyncAfter(deadline: .now() + CPURequestTiming.delayedAfter, execute: delayed) }
         rankingQueue.asyncAfter(deadline: .now() + (helperReady ? CPURequestTiming.sampleTimeout : CPURequestTiming.startupTimeout),
                          execute: timeout)
         client.read { [weak self] result in
             guard let self else { return }
             let duration = ProcessInfo.processInfo.systemUptime - began
             self.rankingQueue.async { [weak self] in
-                guard let self, self.pending?.id == id, self.rankingRequest?.epoch == request.epoch else { return }
-                self.pending?.delayed.cancel(); self.pending?.timeout.cancel(); self.pending = nil
+                guard let self, self.pending?.id == id, let current = self.rankingRequest else { return }
+                self.pending?.delayed?.cancel(); self.pending?.timeout.cancel(); self.pending = nil
                 switch result {
                 case .success(let snapshot):
                     self.helperReady = true; self.retryFailures = 0; self.retryNotBefore = 0
-                    self.receive(snapshot, epoch: request.epoch, requestDuration: duration)
+                    self.receive(snapshot, request: current, requestDuration: duration)
                 case .failure(let error):
                     if let validation = error as? CPUServiceValidationError {
-                        self.client.close(); self.helperReady = false; self.accumulator.reset()
-                        self.rankingRequest = nil
-                        self.publishStatus(validation.status, epoch: request.epoch)
+                        self.publishProcessStatus(validation.status)
+                        self.stopProcessSampling(epoch: current.epoch)
                     } else {
-                        self.scheduleRetry(.retrying("采集暂不可用，正在自动重试。"),
-                                           epoch: request.epoch)
+                        self.scheduleRetry(.retrying("采集暂不可用，正在自动重试。"))
                     }
                 }
             }
         }
     }
 
-    /// 暂时故障断开失效连接并退避；保留差分基线，三十秒内恢复可直接计算，长缺口由差分器重建。
-    private func scheduleRetry(_ status: ProcessCollectionStatus, epoch: UUID) {
+    /// 暂时故障断开并退避；写入历史将这段保留为缺口，实时排行沿用原有过期状态。
+    private func scheduleRetry(_ status: ProcessCollectionStatus) {
         client.close(); helperReady = false
+        diskWriter.reset()
         retryFailures = min(4, retryFailures + 1)
         retryNotBefore = ProcessInfo.processInfo.systemUptime + CPURequestTiming.retryDelay(after: retryFailures)
-        publishStatus(status, epoch: epoch)
+        publishProcessStatus(status)
     }
 
-    /// 差分和应用归类在排行队列完成；主线程仅提交结果，避免千余进程首次归类冻结界面。
-    private func receive(_ snapshot: CPUProcessSnapshot, epoch: UUID, requestDuration: TimeInterval? = nil) {
+    /// 连接不用时取消在途任务，退出或重新授权后从干净连接与退避状态开始。
+    private func closeProcessSource() {
+        pending?.delayed?.cancel(); pending?.timeout.cancel(); pending = nil
+        client.close(); helperReady = false; retryFailures = 0; retryNotBefore = 0
+    }
+
+    /// 确定不兼容时停止此世代的轮询，直到重新打开面板、改变设置或更新授权。
+    private func stopProcessSampling(epoch: UUID) {
+        closeProcessSource(); accumulator.reset(); diskWriter.reset(); resolver.clear()
+        rankingRequest = nil
+        systemQueue.async { [weak self] in
+            guard let self, self.processSchedule?.epoch == epoch else { return }
+            self.processSchedule = nil
+        }
+    }
+
+    /// 隐藏时仅处理磁盘字节，不做实时 CPU 计算、排序、主线程通知和其他资源刷新。
+    private func receive(_ snapshot: CPUProcessSnapshot, request: ProcessRequest, requestDuration: TimeInterval? = nil) {
+        if request.recordsDiskWrites, let history {
+            if snapshot.diskProcesses == nil && !request.visible {
+                stopProcessSampling(epoch: request.epoch)
+                return
+            }
+            if let sample = diskWriter.consume(snapshot, resolver: resolver) {
+                history.appendDiskWrites(start: sample.start, end: sample.end, totals: sample.totals)
+            }
+        }
+        guard request.visible else { return }
+        let epoch = request.epoch
         let values = accumulator.consume(snapshot)
         let groups = values.map { groupedApplications($0) }
         trace("receive time=\(snapshot.uptime) request=\(requestDuration ?? -1) collection=\(snapshot.collectionDuration ?? -1) cores=\(snapshot.cores) usages=\(values?.count ?? -1) epoch=\(epoch)")
@@ -266,8 +354,10 @@ final class CPUMonitor {
         }
     }
 
-    /// 延迟时保留最近结果并明确标记过期；确定的权限或兼容性失败才清空不可用排行。
-    private func publishStatus(_ status: ProcessCollectionStatus, epoch: UUID) {
+    /// 仅在实时详情可见时发布故障状态；同一请求跨前后台时取当前世代。
+    private func publishProcessStatus(_ status: ProcessCollectionStatus) {
+        guard let request = rankingRequest, request.visible else { return }
+        let epoch = request.epoch
         DispatchQueue.main.async { [weak self] in
             guard let self, self.rankingEpoch == epoch else { return }
             self.collectionStatus = status
@@ -287,11 +377,10 @@ final class CPUMonitor {
     /// 退出时同步释放计时器与 XPC 连接，后台服务随后按空闲期限结束。
     func shutdown() {
         systemEpoch = UUID(); rankingEpoch = UUID()
-        systemQueue.sync { timer?.cancel(); timer = nil; rankingEnabled = false }
+        systemQueue.sync { timer?.cancel(); timer = nil; processSchedule = nil }
         rankingQueue.sync {
             rankingRequest = nil
-            pending?.delayed.cancel(); pending?.timeout.cancel(); pending = nil
-            client.close(); localReader.reset(); accumulator.reset(); resolver.clear()
+            closeProcessSource(); localReader.reset(); accumulator.reset(); diskWriter.reset(); resolver.clear()
         }
     }
 }

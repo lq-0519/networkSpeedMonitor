@@ -74,6 +74,15 @@ enum SamplingPreferences {
     }
 }
 
+/// 控制是否在应用运行期间保存软件写入历史，未主动开启时只保留原有实时排行。
+enum DiskWriteHistoryPreferences {
+    /// 从未设置时默认为关闭，避免升级后自动增加管理员采集和本地写入。
+    static var isEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: "diskWriteHistoryEnabled") }
+        set { UserDefaults.standard.set(newValue, forKey: "diskWriteHistoryEnabled") }
+    }
+}
+
 /// 四类应用排行各自保存显示数量；数量只控制展示，不改变采样周期或应用的完整统计总量。
 enum RankingPreferences {
     /// 独立配置项的固定键；网络、CPU、内存默认十项，磁盘默认五项。

@@ -13,10 +13,14 @@ final class SettingsController: NSWindowController {
     var onCPUAuthorization: (() -> Void)?
     /// 显示选项改变后立即刷新菜单栏及电池观察，不重建任何已有采样基线。
     var onMenuBarChange: (() -> Void)?
+    /// 后台写入记录开关已保存，由主应用将偏好交给共享采集器。
+    var onDiskWriteHistoryChange: (() -> Void)?
     /// 管理员采集服务的安装或更新入口。
     private let cpuAuthorization = NSButton(title: "授权系统进程采集…", target: nil, action: nil)
     /// 解释管理员服务同时用于 CPU、内存和磁盘进程统计，不改变自启动开关。
     private let cpuAuthorizationStatus = NSTextField(wrappingLabelWithString: "")
+    /// 独立开启后台低频记录，和实时排行、趋势时间范围分开设置。
+    private let diskHistoryToggle = NSButton(checkboxWithTitle: "后台记录磁盘写入", target: nil, action: nil)
     /// 系统登录启动开关，不使用 UserDefaults 伪造注册状态。
     private let loginToggle = NSButton(checkboxWithTitle: "登录 Mac 后自动启动", target: nil, action: nil)
     /// 系统登记结果或错误信息。
@@ -41,7 +45,7 @@ final class SettingsController: NSWindowController {
         self.monitor = monitor
         self.cpu = cpu
         self.power = power
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 470, height: 637),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 470, height: 674),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "监控设置"
         window.isReleasedWhenClosed = false
@@ -98,7 +102,7 @@ final class SettingsController: NSWindowController {
         for (item, value) in zip(intervalMenu.itemArray, [1, 2, 5]) { item.tag = value }
         intervalMenu.target = self; intervalMenu.action = #selector(changeIntervals)
         addRow("采样间隔", control: intervalMenu, to: root)
-        intervalMenu.toolTip = "设置网络、CPU、内存和磁盘读写周期；电源与风扇后台至少间隔五秒，容量至少间隔十秒。应用排行仅在弹窗打开时采集。"
+        intervalMenu.toolTip = "设置整机趋势和实时排行的采样间隔。电源与风扇后台至少间隔五秒，容量和后台写入记录至少间隔十秒。"
         interfaceMenu.target = self; interfaceMenu.action = #selector(changeInterface)
         interfaceMenu.toolTip = "选择普通网速统计的物理网络；设备直连接口独立汇总，不受此选择影响。"
         addRow("统计网络", control: interfaceMenu, to: root)
@@ -113,7 +117,10 @@ final class SettingsController: NSWindowController {
         cpuAuthorizationStatus.font = .systemFont(ofSize: 11); cpuAuthorizationStatus.textColor = .secondaryLabelColor
         root.addArrangedSubview(cpuAuthorizationStatus)
         cpuAuthorizationStatus.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
-        let note = NSTextField(wrappingLabelWithString: "整机趋势保留最近24小时，范围可选1分钟、10分钟、1小时和24小时。功率与风扇后台低频读取；应用排行仅在弹窗打开时采集，数量分别保存。CPU 与内存展开的子进程最多10个。锁屏、息屏或休眠暂停，缺失区间不补零。")
+        diskHistoryToggle.target = self; diskHistoryToggle.action = #selector(changeDiskWriteHistory)
+        diskHistoryToggle.toolTip = "需要管理员采集权限。弹窗关闭后约每十秒记录各软件的写入量，保留最近二十四小时。"
+        root.addArrangedSubview(diskHistoryToggle)
+        let note = NSTextField(wrappingLabelWithString: "整机趋势与写入记录保留最近24小时，可查看1分钟、10分钟、1小时或24小时。功率与风扇后台低频读取。实时应用排行在弹窗打开时采集，显示数量分别保存。CPU 与内存展开的子进程最多10个。锁屏、息屏或休眠暂停，缺失区间不补零。")
         note.font = .systemFont(ofSize: 11); note.textColor = .secondaryLabelColor
         root.addArrangedSubview(note); note.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
     }
@@ -144,8 +151,9 @@ final class SettingsController: NSWindowController {
         for control in countControls.values { control.refresh() }
         cpuAuthorization.title = CPUPrivilege.isInstalled ? "更新 / 重新授权系统进程采集…" : "授权系统进程采集…"
         cpuAuthorizationStatus.stringValue = CPUPrivilege.isInstalled
-            ? "CPU、内存与磁盘共用管理员服务。仅在弹窗展开时读取，详情关闭后自动退出。"
+            ? "CPU、内存和磁盘共用管理员采集服务。"
             : "授权后读取 CPU、内存和磁盘的系统及其他用户进程。管理员密码仅在 macOS 系统窗口输入。"
+        diskHistoryToggle.state = DiskWriteHistoryPreferences.isEnabled ? .on : .off
         monitor.refreshInterfaces()
         interfaceMenu.removeAllItems()
         interfaceMenu.addItem(withTitle: "自动汇总物理网络")
@@ -199,6 +207,12 @@ final class SettingsController: NSWindowController {
         monitor.restart()
         cpu.restart()
         power.restart()
+    }
+
+    /// 即时保存磁盘后台记录开关，不重启其他资源采样。
+    @objc private func changeDiskWriteHistory() {
+        DiskWriteHistoryPreferences.isEnabled = diskHistoryToggle.state == .on
+        onDiskWriteHistoryChange?()
     }
 
     /// 用户点击后触发系统授权，而非在后台自动弹出密码框。

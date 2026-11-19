@@ -14,7 +14,7 @@ final class OverviewPanelController: NSViewController {
     private let cpuPanel: CPUPanelController
     /// 内存概览与趋势共享整机读取，软件排行继续复用 CPU 进程快照。
     private let memoryPanel: MemoryPanelController
-    /// 磁盘容量与趋势共享轻量读取，应用排行继续使用 CPU 进程快照。
+    /// 磁盘详情展示共用进程快照的实时速度及已保存的时段写入量。
     private let diskPanel: DiskPanelController
     /// 四类一级概览只读取现有模型快照，不持有定时器或进程采集器。
     private let resourceOverview: ResourceOverviewController
@@ -94,6 +94,7 @@ final class OverviewPanelController: NSViewController {
         cpuPanel.onAuthorize = { [weak self] in self?.onAuthorize?() }
         memoryPanel.onAuthorize = { [weak self] in self?.onAuthorize?() }
         diskPanel.onAuthorize = { [weak self] in self?.onAuthorize?() }
+        diskPanel.onSettings = { [weak self] in self?.onSettings?() }
         powerPanel.onEnter = { [weak self] anchor in
             guard let self else { return }
             detailCoordinator.present(.power, anchoredTo: anchor, relativeTo: view)
