@@ -46,8 +46,8 @@ final class ResourceTrendController: NSViewController {
     private let history: TrendHistoryStore
     /// 原有排行控制器，表格仍使用独立滚动区域。
     private let ranking: NSViewController?
-    /// 仅磁盘排行响应共享趋势时间范围和实时／时段切换。
-    private var diskRanking: DiskPanelController? { ranking as? DiskPanelController }
+    /// 磁盘容量图下方的时段写入排行，与上方实时读写排行独立更新。
+    private let diskHistoryRanking: DiskPanelController?
     /// 电源独有的系统电量历史，和功率趋势在同一个详情中上下排列。
     private let batteryHistory: PowerHistoryPanelController?
     /// 电源独有的固定实时流向区，采样仍由一级弹窗的共享模型管理。
@@ -66,7 +66,9 @@ final class ResourceTrendController: NSViewController {
     private var loading = false
     /// 可见范围右边界随真实采样更新，不额外设置 UI 定时器。
     private var end = Date().timeIntervalSince1970
-    /// 当前磁盘排行查询标识，切换模式、范围或隐藏后拒绝旧结果。
+    /// 下方容量图与时段排行共用的右边界；上方实时读写图沿用最新采样时间。
+    private var diskHistoryEnd: TimeInterval?
+    /// 当前磁盘排行查询标识，切换范围或隐藏后拒绝旧结果。
     private var diskHistoryRequest: UUID?
     /// 以单调时钟限制滚动查询，系统日期调整不会导致密集刷新。
     private var lastDiskHistoryRequest: TimeInterval = -.infinity
@@ -89,8 +91,10 @@ final class ResourceTrendController: NSViewController {
 
     /// 组合现有控制器，不改变模型的采样可见性或请求管理员权限。
     init(section: ResourceSection, history: TrendHistoryStore, ranking: NSViewController? = nil,
+         diskHistoryRanking: DiskPanelController? = nil,
          batteryHistory: PowerHistoryPanelController? = nil, powerFlow: PowerFlowPanelController? = nil) {
         self.section = section; self.history = history; self.ranking = ranking
+        self.diskHistoryRanking = diskHistoryRanking
         self.batteryHistory = batteryHistory; self.powerFlow = powerFlow
         super.init(nibName: nil, bundle: nil)
     }
@@ -104,8 +108,8 @@ final class ResourceTrendController: NSViewController {
         case .cpu: return [TrendChartSpec(title: "CPU 占用", metrics: [.cpu], axis: .percent, height: 150)]
         case .memory: return [TrendChartSpec(title: "已用内存", metrics: [.memory], axis: .memory, height: 150)]
         case .network: return [TrendChartSpec(title: "网络速度", metrics: [.download, .upload], axis: .independentMirrored, height: 170)]
-        case .disk: return [TrendChartSpec(title: "磁盘已用容量", metrics: [.diskUsed], axis: .capacity, height: 125),
-                            TrendChartSpec(title: "磁盘读写", metrics: [.diskRead, .diskWrite], axis: .independentMirrored, height: 170)]
+        case .disk: return [TrendChartSpec(title: "磁盘读写", metrics: [.diskRead, .diskWrite], axis: .independentMirrored, height: 170),
+                            TrendChartSpec(title: "磁盘已用容量", metrics: [.diskUsed], axis: .capacity, height: 125)]
         case .power: return [TrendChartSpec(title: "功率对比",
                                             metrics: [.systemPower, .inputPower, .batteryPower],
                                             axis: .signed, height: 190)]
@@ -116,10 +120,11 @@ final class ResourceTrendController: NSViewController {
     /// 展示图表时只查询该资源对应的固定列。
     private var metrics: [TrendMetric] { specifications.flatMap(\.metrics) }
 
-    /// 常规资源上方显示趋势、下方伸缩排行；电源的流向图、电量历史和功率趋势完整纵向展开。
+    /// 组装共享的时间控件与图表；磁盘的两张排行表分别紧跟对应曲线。
     override func loadView() {
         view = NSView(frame: NSRect(x: 0, y: 0, width: 392, height: 460))
         let root = contentStack
+        let pairsDiskRankings = section == .disk && ranking != nil && diskHistoryRanking != nil
         root.orientation = .vertical; root.alignment = .leading; root.spacing = 8; root.detachesHiddenViews = true
         root.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(root)
@@ -149,12 +154,15 @@ final class ResourceTrendController: NSViewController {
         chartStack.detachesHiddenViews = true
         for spec in specifications {
             let chart = TrendChartView(specification: spec)
-            charts.append(chart); chartStack.addArrangedSubview(chart)
+            charts.append(chart)
+            if !pairsDiskRankings {
+                chartStack.addArrangedSubview(chart)
+                chart.widthAnchor.constraint(equalTo: chartStack.widthAnchor).isActive = true
+            }
             let preferred = chart.heightAnchor.constraint(equalToConstant: spec.height)
             preferred.priority = section == .power ? .required : .defaultHigh; preferred.isActive = true
             if section == .power { powerChartHeightConstraint = preferred }
             chart.heightAnchor.constraint(greaterThanOrEqualToConstant: Self.minimumPowerChartHeight).isActive = true
-            chart.widthAnchor.constraint(equalTo: chartStack.widthAnchor).isActive = true
             chart.onHoverTime = { [weak self] time in self?.charts.forEach { $0.setHover(time) } }
         }
         errorLabel.font = .systemFont(ofSize: 10); errorLabel.textColor = .secondaryLabelColor; errorLabel.isHidden = true
@@ -170,13 +178,25 @@ final class ResourceTrendController: NSViewController {
             separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
         }
         root.addArrangedSubview(header)
-        root.addArrangedSubview(chartStack)
-        root.addArrangedSubview(errorLabel)
-        if let ranking {
-            addChild(ranking); root.addArrangedSubview(ranking.view)
-            ranking.view.setContentHuggingPriority(.defaultLow, for: .vertical)
+        if pairsDiskRankings, let ranking, let diskHistoryRanking {
+            addChild(ranking); addChild(diskHistoryRanking)
+            let separator = NSBox(); separator.boxType = .separator
+            for part in [charts[0], ranking.view, separator, charts[1], errorLabel, diskHistoryRanking.view] {
+                root.addArrangedSubview(part)
+            }
+            separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
+            // 两张排行共用剩余空间，表内可滚动，避免窗口较矮时只有一张表可读。
+            let equalRankingHeights = ranking.view.heightAnchor.constraint(equalTo: diskHistoryRanking.view.heightAnchor)
+            equalRankingHeights.priority = .defaultHigh
+            equalRankingHeights.isActive = true
+        } else {
+            root.addArrangedSubview(chartStack)
+            root.addArrangedSubview(errorLabel)
+            if let ranking {
+                addChild(ranking); root.addArrangedSubview(ranking.view)
+                ranking.view.setContentHuggingPriority(.defaultLow, for: .vertical)
+            }
         }
-        diskRanking?.onModeChange = { [weak self] in self?.changeDiskRankingMode() }
         // 无排行时使用底部弹性空间，避免窗口拉高时把图表强行拉伸。
         if ranking == nil && powerFlow == nil {
             let spacer = NSView(); root.addArrangedSubview(spacer)
@@ -225,11 +245,10 @@ final class ResourceTrendController: NSViewController {
     /// 仅当前详情订阅实时曲线；电源可见时同步启动按需系统电量历史读取。
     func setVisible(_ value: Bool) {
         visible = value; epoch = UUID(); loading = false
-        diskHistoryRequest = nil; lastDiskHistoryRequest = -.infinity
+        diskHistoryRequest = nil; lastDiskHistoryRequest = -.infinity; diskHistoryEnd = nil
         history.observe(metrics: value ? metrics : [])
         if value {
             _ = view
-            diskRanking?.prepareForPresentation()
             powerFlow?.setVisible(true)
             batteryHistory?.setVisible(true)
             reload()
@@ -261,10 +280,8 @@ final class ResourceTrendController: NSViewController {
         guard visible, !loading, sample.id > watermark else { return }
         let relevant = sample.values.filter { metrics.contains($0.metric) }
         guard !relevant.isEmpty else { return }
-        let now = Date().timeIntervalSince1970
-        let sharesDiskHistoryWindow = diskRanking?.showsWriteHistory == true
         watermark = sample.id
-        if !sharesDiskHistoryWindow { end = now }
+        end = Date().timeIntervalSince1970
         for value in relevant {
             let previous = series[value.metric]?.last
             let point = TrendPoint(id: sample.id, time: sample.time, value: value.value, segment: sample.segment,
@@ -277,19 +294,24 @@ final class ResourceTrendController: NSViewController {
                 }
             }
         }
-        if sharesDiskHistoryWindow {
-            refreshDiskHistory(through: now)
+        if diskHistoryRanking != nil {
+            if relevant.contains(where: { $0.metric == .diskRead || $0.metric == .diskWrite }), let liveChart = charts.first {
+                trimSeries(only: [.diskRead, .diskWrite])
+                render(only: liveChart)
+            }
+            refreshDiskHistory(through: end)
         } else {
             trimSeries()
             render()
         }
     }
 
-    /// 刷新横轴时裁剪窗口；时段模式保留查询期间晚于本次右边界、下次需绘制的少量新样本。
-    private func trimSeries(keepingNewerSamples: Bool = false) {
-        let start = end - Double(range.rawValue)
-        for metric in metrics {
-            let points = (series[metric] ?? []).filter { $0.time >= start && (keepingNewerSamples || $0.time <= end) }
+    /// 每张图只裁剪自己正在使用的时间窗口，容量保留等待下次时段刷新时需要的新样本。
+    private func trimSeries(only selectedMetrics: [TrendMetric]? = nil) {
+        for metric in selectedMetrics ?? metrics {
+            let chartEnd = metric == .diskUsed ? diskHistoryEnd ?? end : end
+            let start = chartEnd - Double(range.rawValue)
+            let points = (series[metric] ?? []).filter { $0.time >= start && (metric == .diskUsed || $0.time <= chartEnd) }
             // 网络、磁盘容量与读写、风扇保留完整标量，以便旧极值滑出窗口后仍能准确计算新的上下限。
             series[metric] = metric.usesWindowBounds || points.count <= 800
                 ? points : TrendDownsampler.reduce(points, since: start, range: range)
@@ -307,46 +329,34 @@ final class ResourceTrendController: NSViewController {
     private func reload() {
         guard visible else { return }
         let current = UUID(); epoch = current; loading = true
-        diskHistoryRequest = nil; lastDiskHistoryRequest = -.infinity
-        diskRanking?.showWriteHistoryLoading()
+        diskHistoryRequest = nil; lastDiskHistoryRequest = -.infinity; diskHistoryEnd = nil
+        diskHistoryRanking?.showWriteHistoryLoading()
         series.removeAll(); end = Date().timeIntervalSince1970; updateHistoryError(nil); render()
         history.load(metrics: metrics, range: range) { [weak self] snapshot in
             guard let self, self.visible, self.epoch == current else { return }
             self.loading = false; self.series = snapshot.series; self.watermark = snapshot.watermark
-            self.end = self.diskRanking?.showsWriteHistory == true ? snapshot.end : Date().timeIntervalSince1970
+            self.end = Date().timeIntervalSince1970
+            if self.diskHistoryRanking != nil { self.diskHistoryEnd = snapshot.end }
             self.updateHistoryError(snapshot.error)
             self.render()
-            self.refreshDiskHistory(through: self.end)
+            self.refreshDiskHistory(through: snapshot.end)
         }
     }
 
-    /// 切回实时立即显示最近曲线；切到时段时从当前四档选择开始读取排行。
-    private func changeDiskRankingMode() {
-        diskHistoryRequest = nil; lastDiskHistoryRequest = -.infinity
-        guard visible, !loading else { return }
-        if diskRanking?.showsWriteHistory == true {
-            refreshDiskHistory(through: end)
-        } else {
-            end = Date().timeIntervalSince1970
-            trimSeries()
-            render()
-        }
-    }
-
-    /// 同一次完成回调一起推进排行和两张曲线的右边界，防止滚动时显示两个不同区间。
+    /// 时段排行查询完成后与容量图同时前移，实时读写图继续随各自采样刷新。
     private func refreshDiskHistory(through end: TimeInterval) {
-        guard visible, let diskRanking, diskRanking.showsWriteHistory, diskHistoryRequest == nil else { return }
+        guard visible, let diskHistoryRanking, diskHistoryRequest == nil else { return }
         let uptime = ProcessInfo.processInfo.systemUptime
         guard uptime - lastDiskHistoryRequest >= Self.diskHistoryRefreshInterval else { return }
         let request = UUID(), range = self.range
         diskHistoryRequest = request; lastDiskHistoryRequest = uptime
         history.loadDiskWrites(start: end - Double(range.rawValue), end: end,
-                               limit: RankingPreferences.count(for: .disk)) { [weak self, weak diskRanking] snapshot in
-            guard let self, let diskRanking, self.diskHistoryRequest == request else { return }
-            self.diskHistoryRequest = nil; self.end = end
-            self.trimSeries(keepingNewerSamples: true)
-            diskRanking.showWriteHistory(snapshot, range: range)
-            self.render()
+                               limit: RankingPreferences.count(for: .disk)) { [weak self, weak diskHistoryRanking] snapshot in
+            guard let self, let diskHistoryRanking, self.diskHistoryRequest == request else { return }
+            self.diskHistoryRequest = nil; self.diskHistoryEnd = end
+            self.trimSeries(only: [.diskUsed])
+            diskHistoryRanking.showWriteHistory(snapshot, range: range)
+            if let capacityChart = self.charts.last { self.render(only: capacityChart) }
         }
     }
 
@@ -358,10 +368,13 @@ final class ResourceTrendController: NSViewController {
         if visibilityChanged, visible, section == .power { onLayoutChange?() }
     }
 
-    /// 只更新可见图形，没有动画或隐藏页面刷新计时器。
-    private func render() {
+    /// 只更新指定的可见图形，容量图与时段写入排行使用同一个截止时间。
+    private func render(only targetChart: TrendChartView? = nil) {
         guard isViewLoaded else { return }
-        charts.forEach { $0.update(series: series, range: range, end: end, loading: loading) }
+        for chart in targetChart.map({ [$0] }) ?? charts {
+            let chartEnd = chart === charts.last ? diskHistoryEnd ?? end : end
+            chart.update(series: series, range: range, end: chartEnd, loading: loading)
+        }
     }
 }
 

@@ -14,8 +14,10 @@ final class OverviewPanelController: NSViewController {
     private let cpuPanel: CPUPanelController
     /// 内存概览与趋势共享整机读取，软件排行继续复用 CPU 进程快照。
     private let memoryPanel: MemoryPanelController
-    /// 磁盘详情展示共用进程快照的实时速度及已保存的时段写入量。
+    /// 磁盘详情上部展示共用进程快照的实时读写速度。
     private let diskPanel: DiskPanelController
+    /// 磁盘详情下部展示按当前趋势范围汇总的已保存写入量。
+    private let diskHistoryPanel: DiskPanelController
     /// 四类一级概览只读取现有模型快照，不持有定时器或进程采集器。
     private let resourceOverview: ResourceOverviewController
     /// 单一二级浮层复用资源详情控制器，并管理跨窗口悬浮通道。
@@ -65,15 +67,16 @@ final class OverviewPanelController: NSViewController {
         let networkPanel = PanelController(monitor: network)
         let cpuPanel = CPUPanelController(monitor: cpu)
         let memoryPanel = MemoryPanelController(monitor: memory)
-        let diskPanel = DiskPanelController(monitor: disk)
+        let diskPanel = DiskPanelController(monitor: disk, kind: .live)
+        let diskHistoryPanel = DiskPanelController(monitor: disk, kind: .history)
         self.networkPanel = networkPanel; self.cpuPanel = cpuPanel
-        self.memoryPanel = memoryPanel; self.diskPanel = diskPanel
+        self.memoryPanel = memoryPanel; self.diskPanel = diskPanel; self.diskHistoryPanel = diskHistoryPanel
         resourceOverview = ResourceOverviewController(network: network, cpu: cpu, memory: memory, disk: disk)
         trendPanels = [
             .network: ResourceTrendController(section: .network, history: history, ranking: networkPanel),
             .cpu: ResourceTrendController(section: .cpu, history: history, ranking: cpuPanel),
             .memory: ResourceTrendController(section: .memory, history: history, ranking: memoryPanel),
-            .disk: ResourceTrendController(section: .disk, history: history, ranking: diskPanel),
+            .disk: ResourceTrendController(section: .disk, history: history, ranking: diskPanel, diskHistoryRanking: diskHistoryPanel),
             .power: ResourceTrendController(section: .power, history: history, batteryHistory: powerHistoryPanel,
                                              powerFlow: PowerFlowPanelController(monitor: power)),
             .fan: ResourceTrendController(section: .fan, history: history)
@@ -94,7 +97,8 @@ final class OverviewPanelController: NSViewController {
         cpuPanel.onAuthorize = { [weak self] in self?.onAuthorize?() }
         memoryPanel.onAuthorize = { [weak self] in self?.onAuthorize?() }
         diskPanel.onAuthorize = { [weak self] in self?.onAuthorize?() }
-        diskPanel.onSettings = { [weak self] in self?.onSettings?() }
+        diskHistoryPanel.onAuthorize = { [weak self] in self?.onAuthorize?() }
+        diskHistoryPanel.onSettings = { [weak self] in self?.onSettings?() }
         powerPanel.onEnter = { [weak self] anchor in
             guard let self else { return }
             detailCoordinator.present(.power, anchoredTo: anchor, relativeTo: view)
@@ -256,7 +260,7 @@ final class OverviewPanelController: NSViewController {
         detailCoordinator.dismiss()
         trendPanels.values.forEach { $0.resetRange() }
         networkPanel.releaseRanking(); cpuPanel.releaseRanking()
-        memoryPanel.releaseRanking(); diskPanel.releaseRanking()
+        memoryPanel.releaseRanking(); diskPanel.releaseRanking(); diskHistoryPanel.releaseRanking()
     }
 
     /// 二级浮层刚展示时按资源类型刷新已有快照，不修改任何模型的可见性。
@@ -278,7 +282,7 @@ final class OverviewPanelController: NSViewController {
         case .network: networkPanel.releaseRanking()
         case .cpu: cpuPanel.releaseRanking()
         case .memory: memoryPanel.releaseRanking()
-        case .disk: diskPanel.releaseRanking()
+        case .disk: diskPanel.releaseRanking(); diskHistoryPanel.releaseRanking()
         case .power, .fan: break
         }
     }

@@ -241,7 +241,8 @@ final class ResourceDetailCoordinator {
         switch section {
         case .cpu, .memory: return 590
         case .network: return 510
-        case .disk: return 650
+        // 两张排行各自滚动，增高首选尺寸以便同时看到两组趋势和部分行。
+        case .disk: return 810
         case .power: return 650
         case .fan: return 300
         }

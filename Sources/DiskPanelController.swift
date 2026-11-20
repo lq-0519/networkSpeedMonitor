@@ -1,15 +1,31 @@
 import AppKit
 
-/// 磁盘趋势下方的应用排行，可在所选时段的写入量和实时读写速度之间切换。
+/// 磁盘趋势下方的应用排行，实时读写与时段写入各有一张独立表格。
 final class DiskPanelController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
+    /// 固定排行的列及读数口径；两种排行在同一浮层内各自更新。
+    enum RankingKind: Equatable {
+        /// 读取最新进程快照中的实时读写速度。
+        case live
+        /// 展示选定趋势时段内的各软件累计写入量。
+        case history
+
+        /// 两张表共用软件名称列，数字列按各自的单位预留宽度。
+        var columns: [(identifier: String, title: String, width: CGFloat)] {
+            switch self {
+            case .live: return [("app", "软件 / 进程", 202), ("read", "读取", 84), ("write", "写入", 84)]
+            case .history: return [("app", "软件 / 进程", 251), ("write", "累计写入", 120)]
+            }
+        }
+    }
+
     /// 使用主程序唯一的磁盘模型，不重复读取进程。
     private let monitor: DiskMonitor
+    /// 从创建时确定该表属于实时或历史排行，使用对应的数据源和操作。
+    private let kind: RankingKind
     /// 安装或更新同一管理员服务，由主程序统一处理系统认证。
     var onAuthorize: (() -> Void)?
     /// 后台记录关闭时跳转到已有设置窗口，由用户决定是否开启。
     var onSettings: (() -> Void)?
-    /// 用户切换实时和时段排行时通知父控制器同步时间窗口。
-    var onModeChange: (() -> Void)?
     /// 模块名称同时展示当前独立 Top 数量。
     private let titleLabel = NSTextField(labelWithString: "磁盘")
     /// 实时模式显示权限覆盖，时段模式显示覆盖时长和估算提示。
@@ -20,20 +36,13 @@ final class DiskPanelController: NSViewController, NSTableViewDataSource, NSTabl
     private let authorizeButton = NSButton(title: "授权…", target: nil, action: nil)
     /// 关闭后台记录时提供与一级弹窗相同的设置入口。
     private let settingsButton = NSButton(title: "设置…", target: nil, action: nil)
-    /// 时段写入和实时读写可随时切换，初始模式跟随后台记录开关。
-    private let modeControl = NSSegmentedControl(labels: ["实时", "时段写入"], trackingMode: .selectOne,
-        target: nil, action: nil)
     /// 磁盘独立排序，不修改网络的排序选择。
     private let orderControl = NSSegmentedControl(labels: ["合计", "读取", "写入"], trackingMode: .selectOne,
         target: nil, action: nil)
     /// 复用原生列表与已有列宽适配逻辑，读取和写入均完整显示单位。
     private let table = NSTableView()
-    /// 时段排行仅显示应用和累计写入列，格式独立于实时速度列。
-    private let historyTable = NSTableView()
-    /// 实时排行滚动区域，切换到时段模式时整体隐藏。
-    private let liveScroll = RankingScrollView(numberColumnWidths: [84, 84])
-    /// 写入历史滚动区域，为大单位数值保留固定宽度。
-    private let historyScroll = RankingScrollView(numberColumnWidths: [120])
+    /// 每张表独立纵向滚动，较矮的屏幕仍可以查看完整排行。
+    private let scroll: RankingScrollView
     /// 按磁盘曲线使用的十进制口径显示累计字节，不附加速度后缀。
     private let byteFormatter: ByteCountFormatter = {
         let formatter = ByteCountFormatter()
@@ -46,17 +55,14 @@ final class DiskPanelController: NSViewController, NSTableViewDataSource, NSTabl
     private var rows: [DiskApplicationUsage] = []
     /// 所选时段的已排序结果，仅在磁盘详情可见时保留。
     private var historySnapshot: DiskWriteHistorySnapshot?
-    /// 只在记录偏好改变时自动切换默认模式，普通重开仍保留用户上次手动选择。
-    private var lastHistoryPreference = DiskWriteHistoryPreferences.isEnabled
     /// 图标缓存最多五十项，收起后释放。
     private let icons = NSCache<NSString, NSImage>()
 
-    /// 详情首次加载前也可由趋势控制器判断是否需要读取排行。
-    private(set) var showsWriteHistory = DiskWriteHistoryPreferences.isEnabled
-
     /// 构造共享模型的原生面板，和现有网络排行使用相同视觉尺寸。
-    init(monitor: DiskMonitor) {
+    init(monitor: DiskMonitor, kind: RankingKind) {
         self.monitor = monitor
+        self.kind = kind
+        scroll = RankingScrollView(numberColumnWidths: kind.columns.dropFirst().map { $0.width })
         super.init(nibName: nil, bundle: nil)
         icons.countLimit = RankingPreferences.maximumCount
     }
@@ -64,7 +70,7 @@ final class DiskPanelController: NSViewController, NSTableViewDataSource, NSTabl
     /// 磁盘面板仅通过代码创建。
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    /// 同一区域按模式显示实时读写或时段写入，容量由上方趋势图呈现。
+    /// 构建独立的排行标题、状态和表格，供对应趋势图下方直接摆放。
     override func loadView() {
         view = NSView(frame: NSRect(x: 0, y: 0, width: 392, height: 208))
         let root = NSStackView()
@@ -81,13 +87,7 @@ final class DiskPanelController: NSViewController, NSTableViewDataSource, NSTabl
         coverageLabel.font = .systemFont(ofSize: 10); coverageLabel.textColor = .secondaryLabelColor
         coverageLabel.lineBreakMode = .byTruncatingTail
         coverageLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        modeControl.segmentStyle = .rounded; modeControl.controlSize = .small
-        modeControl.selectedSegment = showsWriteHistory ? 1 : 0
-        modeControl.target = self; modeControl.action = #selector(changeRankingMode)
-        modeControl.setAccessibilityLabel("磁盘排行模式")
-        let heading = NSStackView(views: [titleLabel, NSView(), modeControl])
-        heading.alignment = .centerY
-        root.addArrangedSubview(heading)
+        root.addArrangedSubview(titleLabel)
         scopeLabel.font = .systemFont(ofSize: 11); scopeLabel.textColor = .secondaryLabelColor
         scopeLabel.toolTip = "包含所有存储设备，同一 App 的辅助进程合并。受保护进程和短任务可能漏记，系统代办 I/O 会影响归属。"
         orderControl.segmentStyle = .rounded; orderControl.controlSize = .small
@@ -96,26 +96,23 @@ final class DiskPanelController: NSViewController, NSTableViewDataSource, NSTabl
         authorizeButton.target = self; authorizeButton.action = #selector(authorize)
         settingsButton.bezelStyle = .rounded; settingsButton.controlSize = .small
         settingsButton.target = self; settingsButton.action = #selector(openSettings)
-        let toolbar = NSStackView(views: [scopeLabel, coverageLabel, NSView(), settingsButton, authorizeButton, orderControl])
+        let toolbar = NSStackView(views: [scopeLabel, coverageLabel, NSView(), authorizeButton,
+                                         kind == .live ? orderControl : settingsButton])
         toolbar.alignment = .centerY; toolbar.spacing = 5; toolbar.detachesHiddenViews = true
         root.addArrangedSubview(toolbar)
         let container = NSView()
-        configureTable(table, columns: [("app", "软件 / 进程", 202), ("read", "读取", 84), ("write", "写入", 84)])
-        configureTable(historyTable, columns: [("app", "软件 / 进程", 251), ("write", "累计写入", 120)])
-        liveScroll.documentView = table
-        historyScroll.documentView = historyTable
+        configureTable()
+        scroll.documentView = table
         root.addArrangedSubview(container)
-        container.heightAnchor.constraint(greaterThanOrEqualToConstant: 100).isActive = true
-        for scroll in [liveScroll, historyScroll] {
-            scroll.translatesAutoresizingMaskIntoConstraints = false
-            container.addSubview(scroll)
-            NSLayoutConstraint.activate([
-                scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-                scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-                scroll.topAnchor.constraint(equalTo: container.topAnchor),
-                scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor)
-            ])
-        }
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            container.heightAnchor.constraint(greaterThanOrEqualToConstant: 76),
+            scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: container.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        ])
         emptyLabel.font = .systemFont(ofSize: 11); emptyLabel.textColor = .secondaryLabelColor
         emptyLabel.alignment = .center; emptyLabel.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(emptyLabel)
@@ -125,17 +122,20 @@ final class DiskPanelController: NSViewController, NSTableViewDataSource, NSTabl
             emptyLabel.widthAnchor.constraint(equalTo: container.widthAnchor, constant: -24)
         ])
         for child in root.arrangedSubviews { child.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true }
-        applyMode()
+        switch kind {
+        case .live: refresh()
+        case .history: showWriteHistoryLoading()
+        }
     }
 
     /// 两张排行表采用相同的行高和 App 单元格，累计写入与读写速度使用各自的数字列布局。
-    private func configureTable(_ table: NSTableView, columns: [(String, String, CGFloat)]) {
+    private func configureTable() {
         table.backgroundColor = .clear; table.rowHeight = 25
         table.intercellSpacing = NSSize(width: 5, height: 1)
         table.selectionHighlightStyle = .none
         table.allowsColumnReordering = false; table.allowsColumnResizing = false
         table.columnAutoresizingStyle = .noColumnAutoresizing
-        for (id, title, width) in columns {
+        for (id, title, width) in kind.columns {
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
             column.title = title; column.minWidth = 0; column.width = width; column.resizingMask = []
             column.headerCell.font = .systemFont(ofSize: 10, weight: .medium)
@@ -145,34 +145,11 @@ final class DiskPanelController: NSViewController, NSTableViewDataSource, NSTabl
         table.dataSource = self; table.delegate = self
     }
 
-    /// 为当前模式显示对应列表和操作，历史查询由父控制器统一协调。
-    private func applyMode() {
-        liveScroll.isHidden = showsWriteHistory
-        historyScroll.isHidden = !showsWriteHistory
-        orderControl.isHidden = showsWriteHistory
-        if showsWriteHistory {
-            showWriteHistoryLoading()
-        } else {
-            settingsButton.isHidden = true
-            refresh()
-        }
-    }
-
-    /// 从设置返回时启用历史就直接显示写入量，停用后优先显示原有实时速度。
-    func prepareForPresentation() {
-        let enabled = DiskWriteHistoryPreferences.isEnabled
-        guard enabled != lastHistoryPreference else { return }
-        lastHistoryPreference = enabled
-        showsWriteHistory = enabled
-        modeControl.selectedSegment = showsWriteHistory ? 1 : 0
-        if isViewLoaded { applyMode() }
-    }
-
     /// 更新当前快照和独立 Top 数量；权限未完整启用时保留容量但不伪造进程速度。
     func refresh() {
-        guard isViewLoaded, !showsWriteHistory else { return }
+        guard isViewLoaded, kind == .live else { return }
         let count = RankingPreferences.count(for: .disk)
-        titleLabel.stringValue = "磁盘 · 前 \(count)"
+        titleLabel.stringValue = "实时读写排行 · 前 \(count)"
         coverageLabel.stringValue = monitor.isRankingStale ? "结果已过期" : monitor.collectionStatus.summary
             ?? (monitor.deniedProcesses > 0 ? "\(monitor.deniedProcesses) 个受保护" : "管理员采集")
         coverageLabel.textColor = monitor.isRankingStale || monitor.collectionStatus.preservesResult
@@ -183,34 +160,34 @@ final class DiskPanelController: NSViewController, NSTableViewDataSource, NSTabl
         let previousCount = rows.count
         rows = Array(monitor.sortedApplications.prefix(count))
         if previousCount != rows.count { table.reloadData() }
-        else { table.updateExistingRankingCells { [self] cell, row, column in update(cell, in: table, column: column, row: row) } }
+        else { table.updateExistingRankingCells { [self] cell, row, column in update(cell, column: column, row: row) } }
         emptyLabel.stringValue = monitor.rankingStatus; emptyLabel.isHidden = !rows.isEmpty
     }
 
     /// 时间档切换时清除旧范围，避免异步查询期间把旧排行误当成所选时段。
     func showWriteHistoryLoading() {
-        guard isViewLoaded, showsWriteHistory else { return }
+        guard isViewLoaded, kind == .history else { return }
         historySnapshot = nil
-        titleLabel.stringValue = "写入排行 · 前 \(RankingPreferences.count(for: .disk))"
+        titleLabel.stringValue = "时段写入排行 · 前 \(RankingPreferences.count(for: .disk))"
         coverageLabel.stringValue = "读取中…"
         coverageLabel.textColor = .secondaryLabelColor
         coverageLabel.toolTip = nil
         settingsButton.isHidden = DiskWriteHistoryPreferences.isEnabled
         refreshAuthorization()
-        historyTable.reloadData()
+        table.reloadData()
         emptyLabel.stringValue = "正在读取所选时段的写入量…"
         emptyLabel.isHidden = false
     }
 
     /// 展示已采集的写入量及覆盖时间，区分确实没有写入和缺少采样记录。
     func showWriteHistory(_ snapshot: DiskWriteHistorySnapshot, range: TrendRange) {
-        guard isViewLoaded, showsWriteHistory else { return }
+        guard isViewLoaded, kind == .history else { return }
         let previousCount = historySnapshot?.rows.count ?? 0
         historySnapshot = snapshot
         let enabled = DiskWriteHistoryPreferences.isEnabled
         let duration = Self.coverageText(snapshot.coveredSeconds)
         let scope = snapshot.estimated ? " · 含估算" : ""
-        titleLabel.stringValue = "写入排行 · 前 \(RankingPreferences.count(for: .disk))"
+        titleLabel.stringValue = "时段写入排行 · 前 \(RankingPreferences.count(for: .disk))"
         coverageLabel.stringValue = snapshot.error == nil
             ? "已采样 \(duration) / \(range.title)\(scope)" : "记录读取受限"
         coverageLabel.textColor = snapshot.error == nil ? .secondaryLabelColor : .systemOrange
@@ -220,10 +197,10 @@ final class DiskPanelController: NSViewController, NSTableViewDataSource, NSTabl
             .filter { !$0.isEmpty }.joined(separator: "\n")
         settingsButton.isHidden = enabled
         refreshAuthorization()
-        if previousCount != snapshot.rows.count { historyTable.reloadData() }
+        if previousCount != snapshot.rows.count { table.reloadData() }
         else {
-            historyTable.updateExistingRankingCells { [self] cell, row, column in
-                update(cell, in: historyTable, column: column, row: row)
+            table.updateExistingRankingCells { [self] cell, row, column in
+                update(cell, column: column, row: row)
             }
         }
         if let error = snapshot.error { emptyLabel.stringValue = error }
@@ -252,13 +229,14 @@ final class DiskPanelController: NSViewController, NSTableViewDataSource, NSTabl
 
     /// 收起后释放表格和图标缓存，后台不保存完整进程排行。
     func releaseRanking() {
+        let hadSnapshot = !rows.isEmpty || historySnapshot != nil
         rows = []; historySnapshot = nil; icons.removeAllObjects()
-        if isViewLoaded { table.reloadData(); historyTable.reloadData() }
+        if isViewLoaded, hadSnapshot { table.reloadData() }
     }
 
     /// 只返回用户配置截取后的显示行数。
     func numberOfRows(in tableView: NSTableView) -> Int {
-        if tableView === historyTable { return historySnapshot?.rows.count ?? 0 }
+        if kind == .history { return historySnapshot?.rows.count ?? 0 }
         return rows.count
     }
 
@@ -268,7 +246,7 @@ final class DiskPanelController: NSViewController, NSTableViewDataSource, NSTabl
         if column.identifier.rawValue == "app" {
             let cell = tableView.makeView(withIdentifier: column.identifier, owner: self) as? ApplicationCell ?? ApplicationCell(frame: .zero)
             cell.identifier = column.identifier
-            update(cell, in: tableView, column: column, row: row)
+            update(cell, column: column, row: row)
             return cell
         }
         let cell = tableView.makeView(withIdentifier: column.identifier, owner: self) as? NSTableCellView ?? NSTableCellView()
@@ -284,13 +262,14 @@ final class DiskPanelController: NSViewController, NSTableViewDataSource, NSTabl
                 label.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
             ])
         }
-        update(cell, in: tableView, column: column, row: row)
+        update(cell, column: column, row: row)
         return cell
     }
 
     /// 原位覆盖已有行；时段排行显示写入字节，实时排行保留速度和辅助进程数量。
-    private func update(_ cell: NSTableCellView, in source: NSTableView, column: NSTableColumn, row: Int) {
-        if source === historyTable, let snapshot = historySnapshot {
+    private func update(_ cell: NSTableCellView, column: NSTableColumn, row: Int) {
+        if kind == .history {
+            guard let snapshot = historySnapshot, snapshot.rows.indices.contains(row) else { return }
             let app = snapshot.rows[row]
             if let cell = cell as? ApplicationCell {
                 updateApplication(cell, name: app.name, path: app.bundlePath, detail: "")
@@ -300,6 +279,7 @@ final class DiskPanelController: NSViewController, NSTableViewDataSource, NSTabl
             }
             return
         }
+        guard rows.indices.contains(row) else { return }
         let app = rows[row]
         if let cell = cell as? ApplicationCell {
             updateApplication(cell, name: app.name, path: app.bundlePath,
@@ -309,7 +289,7 @@ final class DiskPanelController: NSViewController, NSTableViewDataSource, NSTabl
         }
     }
 
-    /// 实时和时段排行复用同一图标缓存，退出后的 App 仍用记录中的名称和路径显示。
+    /// 相同图标在当前表格更新时复用，退出后的 App 仍用记录中的名称和路径显示。
     private func updateApplication(_ cell: ApplicationCell, name: String, path: String?, detail: String) {
         cell.update(name: name, detail: detail, toolTip: name + (path.map { "\n\($0)" } ?? ""),
             iconKey: path.map { "app:\($0)" } ?? "terminal") { [self] in
@@ -318,13 +298,6 @@ final class DiskPanelController: NSViewController, NSTableViewDataSource, NSTabl
                 let image = NSWorkspace.shared.icon(forFile: path); image.size = NSSize(width: 22, height: 22)
                 icons.setObject(image, forKey: path as NSString); return image
             }
-    }
-
-    /// 标记用户选中的排行模式，父控制器可立即读取当前时间窗口。
-    @objc private func changeRankingMode() {
-        showsWriteHistory = modeControl.selectedSegment == 1
-        applyMode()
-        onModeChange?()
     }
 
     /// 跳转到现有设置页开启或关闭记录，排行面板不直接改变采集策略。

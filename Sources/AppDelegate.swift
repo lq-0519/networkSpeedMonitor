@@ -3,6 +3,28 @@ import CoreGraphics
 
 /// 管理菜单栏、窗口和系统生命周期；主程序不申请辅助功能、录屏或常驻管理员权限。
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+    /// 按实际绘制值比较菜单栏位图，提示文字和原始采样值独立更新。
+    private struct StatusImageKey: Equatable {
+        /// 组件选择决定图像中的内容及宽度。
+        let components: Set<MenuBarComponent>
+        /// 按钮外观决定文字、饼图和符号的实际颜色。
+        let appearance: NSAppearance.Name
+        /// CPU 饼图以半个百分点为步进，省去难以辨认的微小变化重绘。
+        let cpuSteps: Int?
+        /// 内存饼图的实际整数百分比。
+        let memoryPercent: Int?
+        /// 显示时使用的下载速度文本。
+        let download: String
+        /// 显示时使用的上传速度文本。
+        let upload: String
+        /// 电池上行的百分比和对应颜色。
+        let batteryPercent: Int?
+        /// 电池下行的可见状态文字。
+        let batterySecondary: String?
+        /// 是否绘制充电闪电符号。
+        let batteryLightning: Bool
+    }
+
     /// 全应用共享一个模型，菜单栏和弹窗不会各自重复采集总量。
     private let monitor = NetworkMonitor()
     /// CPU 详情和时段写入共用一条进程采集链路，后者同整机趋势保存到同一历史库。
@@ -29,8 +51,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusAppearanceRefreshPending = false
     /// 合并短时间内的 CPU、内存、网速、电池通知；一次性任务只延后绘图，不改变采样或历史记录时刻。
     private var statusRefreshWork: DispatchWorkItem?
-    /// 辅助功能名称只随组件选择变化；外观快照和数值更新不重复提交相同名称。
-    private var statusAccessibilityLabel: String?
+    /// 辅助功能名称只随组件选择变化，保留上次已赋值的选择。
+    private var statusAccessibilityComponents: Set<MenuBarComponent>?
     /// 原生弹窗，点击外部区域自动关闭。
     private let popover = NSPopover()
     /// 弹窗内容控制器，按首次展开创建。
@@ -42,8 +64,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var observers: [(NotificationCenter, NSObjectProtocol)] = []
     /// 屏幕与系统睡眠可能重叠，分别记录以避免过早恢复采集。
     private var sleepReasons = Set<String>()
-    /// 状态按钮最近显示的文本，减少空闲时重复绘制。
-    private var lastTitle = ""
+    /// 与当前已赋值的菜单栏位图对应的绘制值。
+    private var statusImageKey: StatusImageKey?
+    /// 复用格式化网速未变化的两行字形布局和测量结果，只保留当前一份。
+    private var statusNetworkLayout: StatusItemImage.NetworkTextLayout?
     /// 记住当前显示配置下曾使用的最大网速列宽；小缓冲被长数字占用后不随数值回落而回缩。
     private var statusNetworkWidth: CGFloat = 0
     /// 安装更新发送 SIGTERM 时走正常退出路径，等待采集进程回收。
@@ -109,9 +133,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             guard let self else { return }
             let previous = self.memory.systemUsage
             self.memory.receiveSystem(usage); self.disk.receiveSystem(capacity)
-            // 只复用趋势已有的内存读数；图形取整值或压力变化才参与原有合并刷新，不增加采集和周期任务。
+            // 复用趋势读数；内存提示中的容量与压力可独立更新，图形仍按显示的整数占比决定是否重绘。
             if self.statusComponents.contains(.memory),
-               previous?.menuBarPercent != usage?.menuBarPercent || previous?.pressure != usage?.pressure {
+               previous?.usedBytes != usage?.usedBytes || previous?.totalBytes != usage?.totalBytes ||
+               previous?.pressure != usage?.pressure {
                 self.requestStatusItemRefresh()
             }
         }
@@ -121,12 +146,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         monitor.onUpdate = { [weak self] in
             guard let self else { return }
-            self.requestStatusItemRefresh()
+            if self.statusComponents.contains(.network) { self.requestStatusItemRefresh() }
             if self.popover.isShown { self.panel.refreshNetwork() }
         }
         cpu.onUpdate = { [weak self] in
             guard let self else { return }
-            self.requestStatusItemRefresh()
+            if self.statusComponents.contains(.cpu) { self.requestStatusItemRefresh() }
             if self.popover.isShown { self.panel.refreshCPU() }
         }
         power.onUpdate = { [weak self] in
@@ -134,7 +159,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             self.panel.refreshPower()
             self.panel.refreshFans()
         }
-        battery.onUpdate = { [weak self] in self?.requestStatusItemRefresh() }
+        battery.onUpdate = { [weak self] in
+            guard let self, self.statusComponents.contains(.battery) else { return }
+            self.requestStatusItemRefresh()
+        }
         cpu.onProcessSnapshot = { [weak self] snapshot, status in
             guard let self else { return }
             self.memory.receive(snapshot, status: status)
@@ -335,8 +363,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// 显示偏好只更新菜单栏与轻量电池观察，不重启网络、CPU 或任何弹窗采样。
     private func applyMenuBarPreferences() {
-        statusComponents = MenuBarPreferences.components
-        statusNetworkWidth = 0
+        let components = MenuBarPreferences.components
+        if components != statusComponents { statusNetworkWidth = 0 }
+        statusComponents = components
+        if !components.contains(.network) { statusNetworkLayout = nil }
         battery.setEnabled(statusComponents.contains(.battery))
         refreshStatusItem()
     }
@@ -353,51 +383,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(150), execute: work)
     }
 
-    /// 在按钮当前外观下生成一张原生位图；设置与外观变化立即应用，并取消已经被覆盖的合并任务。
+    /// 在显示值变化时生成原生位图，独立更新提示和辅助功能；直接刷新时取消已经被覆盖的合并任务。
     private func refreshStatusItem() {
         statusRefreshWork?.cancel(); statusRefreshWork = nil
         guard let button = statusItem?.button else { return }
         let components = statusComponents
-        let down = monitor.download.map(SpeedText.string) ?? "—"
-        let up = monitor.upload.map(SpeedText.string) ?? "—"
-        let cpuValue = cpu.usage.flatMap { $0.total.isFinite ? min(100, max(0, $0.total)) : nil }
-        let percent = cpuValue.map { Int($0.rounded()) }
-        let cpuText = percent.map(String.init) ?? "—"
+        let showsNetwork = components.contains(.network)
+        let down = showsNetwork ? monitor.download.map(SpeedText.string) ?? "—" : ""
+        let up = showsNetwork ? monitor.upload.map(SpeedText.string) ?? "—" : ""
+        let cpuValue = components.contains(.cpu)
+            ? cpu.usage.flatMap { $0.total.isFinite ? min(100, max(0, $0.total)) : nil }
+            : nil
         let memoryUsage = components.contains(.memory) ? memory.systemUsage : nil
         let memoryValue = memoryUsage?.menuBarPercent
-        let batteryStatus = battery.snapshot
-        let selection = MenuBarComponent.allCases.filter(components.contains)
-        let title = [selection.map(\.rawValue).joined(separator: ","), button.effectiveAppearance.name.rawValue,
-                     components.contains(.cpu) ? cpuValue.map { String(format: "%.2f", $0) } ?? "—" : "",
-                     components.contains(.memory) ? memoryValue.map(String.init) ?? "—" : "",
-                     components.contains(.network) ? "\(down)|\(up)" : "",
-                     components.contains(.battery) ? "\(batteryStatus?.percentageText ?? "—")|\(batteryStatus?.secondaryText ?? "—")|\(batteryStatus?.showsLightning == true)" : ""]
-            .joined(separator: "|")
-        if title != lastTitle {
-            if components.contains(.network) {
-                statusNetworkWidth = max(statusNetworkWidth, StatusItemImage.networkWidth(download: down, upload: up))
+        let batteryStatus = components.contains(.battery) ? battery.snapshot : nil
+        let appearance = button.effectiveAppearance
+        let key = StatusImageKey(components: components, appearance: appearance.name,
+                                 cpuSteps: cpuValue.map { Int(($0 * 2).rounded()) }, memoryPercent: memoryValue,
+                                 download: down, upload: up, batteryPercent: batteryStatus?.percent,
+                                 batterySecondary: batteryStatus?.secondaryText,
+                                 batteryLightning: batteryStatus?.showsLightning == true)
+        if key != statusImageKey {
+            if showsNetwork, statusNetworkLayout?.download != down || statusNetworkLayout?.upload != up {
+                statusNetworkLayout = StatusItemImage.NetworkTextLayout(download: down, upload: up)
+            }
+            if let layout = statusNetworkLayout {
+                statusNetworkWidth = max(statusNetworkWidth, layout.width)
             }
             var image: NSImage?
-            button.effectiveAppearance.performAsCurrentDrawingAppearance {
-                image = StatusItemImage.make(download: down, upload: up, cpuPercent: cpuValue, memoryPercent: memoryValue,
-                                             components: components, battery: batteryStatus, minimumNetworkWidth: statusNetworkWidth)
+            appearance.performAsCurrentDrawingAppearance {
+                image = StatusItemImage.make(network: statusNetworkLayout, cpuPercent: key.cpuSteps.map { Double($0) / 2 },
+                                             memoryPercent: memoryValue, components: components, battery: batteryStatus,
+                                             minimumNetworkWidth: statusNetworkWidth)
             }
             if let image {
                 // 原有按钮两侧各 4pt 留白保持不变，内容整体交给按钮处理非活动和选中状态。
                 let width = image.size.width + 8
                 if statusItem?.length != width { statusItem?.length = width }
                 button.image = image
-                lastTitle = title
+                statusImageKey = key
             }
         }
-        let directDown = monitor.directDownload.map(SpeedText.string) ?? "—"
-        let directUp = monitor.directUpload.map(SpeedText.string) ?? "—"
-        let directDetail = monitor.directActivity.isVisible ? "\n设备直连：接收 \(directDown) · 发送 \(directUp)" : ""
         var details: [String] = []
-        if components.contains(.network) {
+        if showsNetwork {
+            var directDetail = ""
+            if monitor.directActivity.isVisible {
+                let directDown = monitor.directDownload.map(SpeedText.string) ?? "—"
+                let directUp = monitor.directUpload.map(SpeedText.string) ?? "—"
+                directDetail = "\n设备直连：接收 \(directDown) · 发送 \(directUp)"
+            }
             details.append("下载 \(down) · 上传 \(up)\(directDetail)\n\(monitor.sourceDescription) · \(monitor.status)")
         }
-        if components.contains(.cpu) { details.append("整机 CPU：\(cpuText)% · \(cpu.interval) 秒刷新") }
+        if components.contains(.cpu) {
+            let cpuText = cpuValue.map { String(Int($0.rounded())) } ?? "—"
+            details.append("整机 CPU：\(cpuText)% · \(cpu.interval) 秒刷新")
+        }
         if components.contains(.memory) {
             if let usage = memoryUsage, let memoryValue {
                 details.append("内存：\(memoryValue)% · 已用 \(MemoryText.string(usage.usedBytes)) / 总量 \(MemoryText.string(usage.totalBytes)) · 压力 \(usage.pressure.title)")
@@ -411,10 +451,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             button.toolTip = detail
             button.setAccessibilityValue(details.joined(separator: "，"))
         }
-        let label = selection.map(\.title).joined(separator: "、")
-        if statusAccessibilityLabel != label {
+        if statusAccessibilityComponents != components {
+            let label = MenuBarComponent.allCases.filter(components.contains).map(\.title).joined(separator: "、")
             button.setAccessibilityLabel(label)
-            statusAccessibilityLabel = label
+            statusAccessibilityComponents = components
         }
     }
 
